@@ -135,6 +135,9 @@ class CallService:
         self._contexts = {}
         self._tasks = set()
         self._changed = {}
+        # Calls closed before they could finish (a stop, a restart): their usage is still
+        # recorded, once each, so a hosted deployment settles what call_started held.
+        self._unsettled = []
 
     @property
     def environ(self):
@@ -223,13 +226,20 @@ class CallService:
         return {'ok': not problems, 'brief': brief.to_dict(), 'problems': problems, 'carried': carried}
 
     def reconcile(self):
-        """At startup, close calls a previous daemon left unfinished; nothing will finish them."""
+        """At startup, close calls a previous daemon left unfinished; nothing will finish them.
+        Their usage is recorded as for any finished call."""
         closed = []
         for record in self.store.list(limit=1000):
             if record['status'] in TERMINAL or record['id'] in self._contexts:
                 continue
             self._close_unfinished(record['id'], 'The daemon stopped before the call finished.')
             closed.append(record['id'])
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return closed  # No event loop yet: shutdown records them.
+        if closed:
+            self._spawn(self._settle_unfinished(), name='settle-unfinished-calls')
         return closed
 
     async def create(self, payload, *, request=None):
@@ -797,7 +807,9 @@ class CallService:
             self._set_status(call_id, 'failed', endReason='error', error=error, usage=usage,
                              cost=call_cost(dict(record, usage=usage), self.environ))
         else:
-            self._set_status(call_id, 'summarizing', endReason=end_reason)
+            # The line's usage is kept now, so a stop while the result is written loses none.
+            self._set_status(call_id, 'summarizing', endReason=end_reason, usage=usage,
+                             cost=call_cost(dict(record, usage=usage), self.environ))
             try:
                 result = await self._build_result(context, end_reason, usage, handoff)
             except asyncio.CancelledError:
@@ -823,16 +835,31 @@ class CallService:
         if self._needs_price(record):
             self._price_checked.add(call_id)
             self._spawn(self._settle_price(call_id))
-        try:
-            await maybe_await(self.hooks.record_usage(record['owner'], record, record.get('usage') or {}))
-        except Exception:
-            self._event(call_id, 'call.usage_failed')
+        await self._record_usage(record)
         try:
             delivery = await self.hooks.notify(record['owner'], record)
         except Exception as notify_error:
             delivery = {'delivered': False, 'error': type(notify_error).__name__}
         if delivery is not None:
             self._event(call_id, 'call.webhook', **delivery)
+
+    async def _record_usage(self, record):
+        """Tell the hooks what a finished call used, with the call's owner."""
+        try:
+            await maybe_await(self.hooks.record_usage(record['owner'], record, record.get('usage') or {}))
+        except Exception:
+            self._event(record['id'], 'call.usage_failed')
+
+    async def _settle_unfinished(self):
+        """Record the usage of calls closed before they could finish, once each, with what is
+        known of them (the line's usage when it got that far)."""
+        while self._unsettled:
+            call_id = self._unsettled.pop(0)
+            try:
+                record = self.store.get(call_id)
+            except CallNotFound:
+                continue
+            await self._record_usage(record)
 
     async def shutdown(self):
         active = list(self._contexts)
@@ -849,12 +876,15 @@ class CallService:
             if self.store.get(call_id)['status'] not in TERMINAL:
                 self._close_unfinished(call_id, 'The daemon stopped before the call finished.')
         self._contexts.clear()
+        await self._settle_unfinished()
 
     def _close_unfinished(self, call_id, message):
-        """Mark a call that can no longer finish as failed, keeping what was said."""
+        """Mark a call that can no longer finish as failed, keeping what was said; its usage
+        is recorded by _settle_unfinished."""
         transcript = [{'speaker': e['data'].get('speaker'), 'text': e['data'].get('text')}
                       for e in self.store.events(call_id) if e['type'] == 'call.transcript']
         result = fallback_result('error', transcript, 0, message.rstrip('.').lower())
         result['outcome'] = 'failed'
         self.store.update(call_id, result=result, error=message)
         self._set_status(call_id, 'failed', endReason='error')
+        self._unsettled.append(call_id)

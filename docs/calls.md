@@ -218,7 +218,7 @@ The call service calls a small hooks object so a managed deployment can add acco
 | `call_started(owner, record)` | Nothing. Runs once the call is recorded, before its line starts. Raising `CallRefused` ends the call as `failed` (`endReason: refused`) and answers with the refusal; any other error ends it too, with `503 call_start_failed`. |
 | `contact_book(owner)` | The owner's saved contacts, `contacts.json` under `storage_root(owner)`. |
 | `do_not_call(owner)`, `update_do_not_call(owner, update)` | Read and change `do-not-call.json` under `storage_root(owner)` (`.smitline/do-not-call.json` for `local`). Without them, `/v1/do-not-call` returns `501` and a request not to be called again is only reported in the result. |
-| `record_usage(owner, call, usage)` | Appends a line to `usage.jsonl` in the call store. |
+| `record_usage(owner, call, usage)` | Appends a line to `usage.jsonl` in the call store. Runs once for every call that started, with the call's owner: also for a call the daemon closed because it stopped or restarted, with the usage known by then (none if the line had not reported it yet). Never for a call refused before it started. |
 | `notify(owner, call)` | Sends the brief's webhook, if any, signed with `webhook_secret(owner)`. |
 | `webhook_secret(owner)` | The installation's secret for `local`; for any other owner a secret of its own, made on first use in `webhook.secret` under `storage_root(owner)`. |
 | `owner_for_number(number)` | Who an incoming call to `number` (E.164, or `None` when the provider sent none) is for: `local` when `SMITLINE_ACCEPT_INBOUND=1`, else `None`, which turns the call away. |
@@ -234,7 +234,7 @@ Every call record, meeting, profile, contact book and do-not-call list belongs t
 
 `owner_for(request)` decides the owner from the credential the daemon verified, which it keeps as `request['smitline_auth']`: `{"kind": "launch"}` for the per-launch token, `{"kind": "api", "token": {"id", "name", "kind", "owner"}}` for an API token.
 
-- An API token created with `--owner OWNER` always acts as that owner.
+- An API token created with `--owner OWNER` always acts as that owner; even an internal one gets `403 owner_header_forbidden` for a header naming another owner.
 - An API token created with `--kind internal` (a hosted service's gateway) names the owner of each request with `X-Smitline-Owner: OWNER`. From any other credential the header is refused with `403 owner_header_forbidden`; an id that is not an owner id is `400 invalid_owner`.
 - Everything else is `local`.
 
@@ -242,7 +242,7 @@ Every call record, meeting, profile, contact book and do-not-call list belongs t
 
 These settings are read per owner, through `settings(owner)`: `SMITLINE_OWNER_NAME`, `SMITLINE_OWNER_PHONE`, `SMITLINE_CALLER_ID`, `SMITLINE_VOICE`, `SMITLINE_EXTRA_VOICES`, `SMITLINE_ALLOWED_CALLING_CODES`, `SMITLINE_CALLING_HOURS`, `SMITLINE_MAX_CALLS_PER_NUMBER`, `SMITLINE_MAX_CALLS_PER_HOUR`, `SMITLINE_ALLOW_PREMIUM_NUMBERS`, `SMITLINE_RECORD_CALLS`, `SMITLINE_NOTIFY_WEBHOOK` (incoming calls) and `SMITLINE_PARTICIPANT_NAME`. Provider keys, prices, models and the audio mode stay installation-wide.
 
-Phone callbacks are checked with the credentials of the call's owner, and an incoming call with those of the owner `owner_for_number` gives for the number called, whose settings build its brief. A meeting for an owner other than `local` gets that owner's `OPENAI_API_KEY`, and `SMITLINE_VOICE`, `SMITLINE_PARTICIPANT_NAME` and `SMITLINE_OWNER_NAME` from its settings, over the shared `.env`: the daemon writes them to a private file for `docker compose`, which reads it after `.env` and `.env.meeting` (`SMITLINE_MEETING_ENV_FILE`), and deletes it once the container is created. Its `SMITLINE_PARTICIPANT_NAME` is the name the meeting joins under.
+Phone callbacks are checked with the credentials of the call's owner, and an incoming call with those of the owner `owner_for_number` gives for the number called, whose settings build its brief. A meeting for an owner other than `local` gets that owner's `OPENAI_API_KEY`, and `SMITLINE_VOICE`, `SMITLINE_PARTICIPANT_NAME` and `SMITLINE_OWNER_NAME` from its settings (blank when the owner has none, never the shared `.env`'s), over the shared `.env`: the daemon writes them to a private file for `docker compose`, which reads it after `.env` and `.env.meeting` (`SMITLINE_MEETING_ENV_FILE`), and deletes it once the container is created. Its `SMITLINE_PARTICIPANT_NAME` is the name the meeting joins under.
 
 ### Several meetings at once
 

@@ -14,7 +14,7 @@ import secrets
 from aiohttp import WSMsgType, web
 
 from call_brief import normalize_phone
-from call_hooks import LOCAL_OWNER, MissingCredentials, maybe_await, owner_settings
+from call_hooks import LOCAL_OWNER, MissingCredentials, maybe_await, owner_required, owner_settings
 from call_service import CallError
 from call_store import CallNotFound
 from live_sip import incoming_call, verify_webhook
@@ -123,7 +123,11 @@ def create_gateway_app(line, service, *, current_url, owner=LOCAL_OWNER):
         lookup = getattr(service.hooks, 'owner_for_number', None)
         if lookup is not None:
             return await maybe_await(lookup(number))
-        return owner if line.environ().get('SMITLINE_ACCEPT_INBOUND') == '1' else None
+        # Hooks written before owners: the local owner's calls, unless no local owner exists.
+        env = line.environ()
+        if owner_required(env) or env.get('SMITLINE_ACCEPT_INBOUND') != '1':
+            return None
+        return owner
 
     async def inbound(request):
         try:

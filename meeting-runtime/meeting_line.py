@@ -41,10 +41,11 @@ def context_from_brief(brief):
 
 
 def meeting_environment(hooks, owner):
-    """The OpenAI key, voice, and name a meeting for `owner` runs with."""
+    """The OpenAI key, voice, and name a meeting for `owner` runs with. A setting the owner
+    has not set is blank, never the shared .env's value, which is the installation's."""
     env = {'OPENAI_API_KEY': hooks.credentials(owner, 'openai')['apiKey']}
     settings = owner_settings(hooks, owner)
-    env.update({key: settings[key] for key in MEETING_SETTINGS if settings.get(key)})
+    env.update({key: str(settings.get(key) or '') for key in MEETING_SETTINGS})
     return env
 
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -7,6 +8,7 @@ import {
   Smitline,
   ValidationError,
   StartupError,
+  RuntimeError,
   createLoopbackTransport,
   createRemoteTransport,
   isManaged,
@@ -128,6 +130,105 @@ test('a remote daemon needs a URL and a token', () => {
     spawnDaemon: () => { spawned = true; } });
   assert.equal(transport.origin, 'https://smitline.example.com');
   assert.equal(spawned, false);
+});
+
+/** A hosted daemon stand-in: answers each route with a canned status and body, and records requests. */
+async function startScriptedDaemon(t, routes) {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    const chunks = [];
+    request.on('data', (chunk) => chunks.push(chunk));
+    request.on('end', () => {
+      const url = new URL(request.url, 'http://127.0.0.1');
+      requests.push({ method: request.method, path: url.pathname, search: url.search, headers: request.headers,
+        body: Buffer.concat(chunks).toString('utf8') });
+      const answer = routes[`${request.method} ${url.pathname}`] || { status: 404, body: { error: { code: 'not_found', message: 'no such route' } } };
+      const raw = Buffer.isBuffer(answer.body) ? answer.body : Buffer.from(JSON.stringify(answer.body));
+      response.writeHead(answer.status, { 'Content-Type': answer.contentType || 'application/json' });
+      response.end(raw);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  return { requests, url: `http://127.0.0.1:${server.address().port}` };
+}
+
+test('a remote daemon keeps the status, code and details of every refusal', async (t) => {
+  const refusals = [
+    [402, { code: 'insufficient_credit', message: 'Top up to call.', balance: '4.20', affordableMinutes: 21, topUpUrl: 'https://example.com/wallet' }, RuntimeError],
+    [429, { code: 'too_many_active_calls', message: 'One call at a time.', limit: 1 }, RuntimeError],
+    [403, { code: 'verification_required', message: 'Verify your phone.', verifyUrl: 'https://example.com/verify' }, RuntimeError],
+    [401, { code: 'owner_required', message: 'This deployment serves accounts: authenticate as one.' }, RuntimeError],
+    [400, { code: 'invalid_owner', message: 'An owner id is lowercase letters, digits, _ and -, at most 64 characters.' }, ValidationError],
+    [503, { code: 'call_start_failed', message: 'The call could not be started.' }, StartupError],
+  ];
+  for (const [status, error, kind] of refusals) {
+    const daemon = await startScriptedDaemon(t, { 'POST /v1/calls': { status, body: { error } } });
+    const colleague = new Smitline({ baseUrl: daemon.url, token: 'cai_gateway', headers: { 'X-Smitline-Owner': 'acct_a' } });
+    const { code, message, ...details } = error;
+    await assert.rejects(colleague.startCall({ channel: 'phone', to: '+14155550142', objective: 'x' }), (thrown) => {
+      assert.ok(thrown instanceof kind, `${status} is a ${kind.name}`);
+      assert.equal(thrown.status, status);
+      assert.equal(thrown.code, code);
+      assert.equal(thrown.message, message);
+      if (Object.keys(details).length) assert.deepEqual(thrown.details, details);
+      else assert.equal(thrown.details, undefined);
+      return true;
+    });
+    // A refusal is final: the remote transport never retries it.
+    assert.equal(daemon.requests.length, 1);
+  }
+});
+
+test('a remote daemon long-polls and downloads with its own token and headers only', async (t) => {
+  const done = { id: 'call-0000000000000001', status: 'completed', result: { outcome: 'achieved' } };
+  const daemon = await startScriptedDaemon(t, {
+    'GET /prefix/v1/calls/call-0000000000000001/wait': { status: 200, body: done },
+    'GET /prefix/v1/calls/call-0000000000000001/recording': { status: 200, body: Buffer.from('RIFF....WAVE'), contentType: 'audio/wav' },
+    'GET /prefix/v1/calls': { status: 200, body: { calls: [done], spend: { days: [] } } },
+  });
+  const colleague = new Smitline({
+    baseUrl: `${daemon.url}/prefix/`,
+    token: 'cai_gateway',
+    headers: { 'x-smitline-owner': 'acct_a', authorization: 'Bearer stolen', AUTHORIZATION: 'Bearer stolen' },
+  });
+  assert.equal((await colleague.waitForCall(done.id, 9999)).status, 'completed');
+  const audio = await colleague.downloadRecording(done.id, { format: 'wav' });
+  assert.equal(audio.contentType, 'audio/wav');
+  assert.equal(Buffer.from(audio.data).toString(), 'RIFF....WAVE');
+  assert.deepEqual(await colleague.listCalls(5, { channel: 'phone' }), [done]);
+  assert.deepEqual(daemon.requests.map((request) => request.path + request.search), [
+    '/prefix/v1/calls/call-0000000000000001/wait?timeout=280',
+    '/prefix/v1/calls/call-0000000000000001/recording?format=wav',
+    '/prefix/v1/calls?limit=5&channel=phone',
+  ]);
+  for (const request of daemon.requests) {
+    assert.equal(request.headers.authorization, 'Bearer cai_gateway');
+    assert.equal(request.headers['x-smitline-owner'], 'acct_a');
+  }
+});
+
+test('a remote daemon never reads daemon.auth, starts a daemon, or probes a local port', async () => {
+  const touched = [];
+  const options = {
+    baseUrl: 'http://127.0.0.1:1',
+    token: 'cai_gateway',
+    managed: false,
+    fs: { readFile: async (file) => { touched.push(['readFile', file]); return 'local-token'; } },
+    readAuth: async () => { touched.push(['readAuth']); return 'local-token'; },
+    spawnDaemon: () => { touched.push(['spawn']); return { unref() {} }; },
+    isPortOpen: async () => { touched.push(['isPortOpen']); return false; },
+    fetchImpl: async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:1 with Bearer cai_gateway'); },
+  };
+  for (const colleague of [new Smitline(options), new Smitline({ transport: createRemoteTransport(options) })]) {
+    await assert.rejects(colleague.listCalls(), (error) => {
+      assert.ok(error instanceof StartupError);
+      assert.equal(error.code, 'daemon_unavailable');
+      assert.ok(!error.message.includes('cai_gateway'), 'the token is not echoed');
+      return true;
+    });
+  }
+  assert.deepEqual(touched, []);
 });
 
 test('startup errors are StartupError', async (t) => {

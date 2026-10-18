@@ -553,7 +553,8 @@ class MeetingOwnerEnvironmentTests(unittest.IsolatedAsyncioTestCase):
     def test_env_file_values_arrive_exactly(self):
         from meeting_supervisor import owner_env_file
         body = owner_env_file({'A': "O'Neil", 'B': 'say "hi" \\ $HOME', 'C': 'two\nlines', 'D': ''})
-        self.assertEqual(body, 'A="O\'Neil"\nB="say \\"hi\\" \\\\ \\$HOME"\n')
+        # A value compose cannot carry, or none, is blank: never the shared .env's value.
+        self.assertEqual(body, 'A="O\'Neil"\nB="say \\"hi\\" \\\\ \\$HOME"\nC=""\nD=""\n')
 
 
 if __name__ == '__main__':

@@ -52,13 +52,16 @@ COMPLETE_REASONS = frozenset({'finished', 'meeting_ended'})
 def owner_env_file(values):
     """KEY="value" lines for compose's env_file. Inside double quotes compose reads a
     backslash before a backslash, a quote, or a dollar sign as that character, so a value
-    arrives exactly as given (O'Neil, $5). A value with a control character is left out."""
+    arrives exactly as given (O'Neil, $5). Every key is written: a value with a control
+    character, or none, is blank, so the shared .env read before this file never fills in
+    for the owner."""
     lines = []
     for key, value in values.items():
         value = str(value or '')
-        if value and not any(ord(char) < 32 or ord(char) == 127 for char in value):
-            quoted = value.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
-            lines.append(f'{key}="{quoted}"')
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            value = ''
+        quoted = value.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
+        lines.append(f'{key}="{quoted}"')
     return ''.join(line + '\n' for line in lines)
 
 
