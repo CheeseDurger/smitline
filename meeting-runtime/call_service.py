@@ -5,7 +5,9 @@ import os
 
 from call_brief import BriefIncomplete, CallBrief
 from call_costs import call_cost, spend, with_cost
-from call_hooks import CallRefused, LineNotReady, MissingCredentials, maybe_await, owner_settings
+from call_hooks import (
+    LOCAL_OWNER, CallRefused, LineNotReady, MissingCredentials, maybe_await, owner_settings,
+)
 from call_result import (
     DEFAULT_SUMMARY_MODEL, ResponsesSummarizer, SummaryUnavailable, fallback_result,
     result_from_handoff, result_without_conversation, transcript_entries,
@@ -423,11 +425,12 @@ class CallService:
     # Contacts, tasks, and notes for later calls ------------------------------
 
     def _owner_contact_book(self, owner):
-        """hooks.contact_book(owner); hooks written before owners keep one book attribute."""
+        """hooks.contact_book(owner); hooks written before owners keep one book attribute,
+        which is the local owner's: another owner has none."""
         book = getattr(self.hooks, 'contact_book', None)
         if callable(book):
             return book(owner)
-        return book
+        return book if owner == LOCAL_OWNER else None
 
     def _contact_book(self, owner):
         book = self._owner_contact_book(owner)
