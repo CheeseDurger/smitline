@@ -167,7 +167,9 @@ Webhook bodies are signed: `X-Smitline-Signature: sha256=<hex HMAC of the raw bo
 
 - Statuses only move forward; a late provider callback cannot move a call back.
 - `POST /v1/calls/check` applies the same checks as starting a call, including the destination allow-list.
-- When the daemon stops, calls still in progress are closed as `failed` with the transcript so far. At startup, any call a previous daemon left unfinished is closed the same way, so a waiting agent always gets an answer.
+- When the daemon stops, each call still in progress is asked to end (a phone call hangs up) and gets `SMITLINE_SHUTDOWN_GRACE` seconds (default 5; `0` cuts calls off at once) to finish and report what it used; a call still running after that is closed as `failed` with the transcript so far. At startup, any call a previous daemon left unfinished is closed the same way, so a waiting agent always gets an answer.
+- A phone call's `usage.phoneSeconds` is its connected time: the provider's, from its status callback, or when none arrives (incoming calls never get one), measured from when the call's audio connected to when it ended. A meeting's `usage.voiceSeconds` runs from when Smitline was let in to when the meeting ended.
+- A meeting call that cannot get a meeting container is refused when it is placed, by `POST /v1/calls` and `/v1/calls/check`, rather than accepted and failed a moment later: `409 capacity_exceeded` (the one container is busy, or the pool is full), `409 owner_capacity_exceeded`, `409 meeting_pool_required` or `503 no_free_ports` (see [several meetings at once](#several-meetings-at-once)). The supervisor checks again when the meeting starts, so two calls placed at the same moment for the last place still get one answer each.
 - Long transcripts keep their first 60 and last 340 lines, so the opening (with the disclosure) survives.
 
 ## Other endpoints

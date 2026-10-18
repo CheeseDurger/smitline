@@ -100,7 +100,8 @@ class ServiceHarness:
         self.summarizer = FakeSummarizer()
         self.service = CallService(self.store, hooks=self.hooks,
                                    lines=lines if lines is not None else {'phone': self.line},
-                                   summarizer_factory=lambda owner: self.summarizer, environ={})
+                                   summarizer_factory=lambda owner: self.summarizer, environ={},
+                                   shutdown_grace=0.2)
 
 
 class CallServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -288,6 +289,33 @@ class FakeDaemon:
 
 
 class MeetingLineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_voice_seconds_stop_when_the_meeting_ends(self):
+        # The handoff can take a while to appear after a meeting ends; that is not meeting time.
+        with tempfile.TemporaryDirectory() as temp:
+            clock = [0.0]
+
+            class Timed(FakeDaemon):
+                async def get_meeting(self, meeting_id, owner=None):
+                    clock[0] += 30  # each look at the meeting is 30 s after the last
+                    return await super().get_meeting(meeting_id, owner)
+
+                async def get_handoff(self, meeting_id, owner=None):
+                    clock[0] += 50  # each look for its handoff takes 50 s
+                    return await super().get_handoff(meeting_id, owner)
+            daemon = Timed()
+            daemon.states = ['joining', 'live', 'live', 'ended']
+
+            async def no_sleep(_seconds):
+                await asyncio.sleep(0)
+            line = MeetingLine(daemon, sleep=no_sleep, monotonic=lambda: clock[0])
+            h = ServiceHarness(temp, lines={'meeting': line})
+            record = await h.service.create(brief(channel='meeting', to=ZOOM))
+            done = await h.service.wait(record['id'], timeout=5, owner='local')
+            # Live from t=60 to the end at t=120: 60 s, not the 160 s until the handoff came.
+            self.assertEqual(done['usage']['voiceSeconds'], 60)
+            self.assertEqual(daemon.handoff_tries, 2)
+            await h.service.shutdown()
+
     async def test_meeting_call_follows_meeting_to_handoff(self):
         with tempfile.TemporaryDirectory() as temp:
             daemon = FakeDaemon()
@@ -597,6 +625,43 @@ class MeetingThroughRealDaemonTests(unittest.IsolatedAsyncioTestCase):
             done = await harness.service.wait(record['id'], timeout=5, owner='local')
             self.assertEqual(done['status'], 'completed')
             self.assertIn('2 transcript entries', done['result']['summary'])
+            await harness.service.shutdown()
+            app.runtime_daemon.close()
+
+
+class MeetingCapacityTests(unittest.IsolatedAsyncioTestCase):
+    """A meeting that cannot start for want of a meeting container is refused when the call is
+    placed, with the code, and nothing is recorded; start() still checks, for races."""
+
+    async def test_a_busy_meeting_container_refuses_the_call_up_front(self):
+        from meeting_supervisor import ProductionMeetingSupervisor
+        from test_meeting_supervisor import FakeHealth, FakeLauncher
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'meeting-runtime').mkdir()
+            supervisor = ProductionMeetingSupervisor(
+                root, runtime_root=root / 'meeting-runtime', launcher=FakeLauncher(),
+                health=FakeHealth(), poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4)
+            harness = ServiceHarness(temp)
+
+            def lines(daemon):
+                harness.service.lines = {'meeting': MeetingLine(daemon, poll_interval=0.01, handoff_timeout=0.2)}
+                return harness.service
+            app = create_app(root=root / 'daemon', auth_token='t', supervisor=supervisor,
+                             call_service_factory=lines)
+            supervisor.bind_daemon(app.runtime_daemon)
+            await harness.service.create(brief(channel='meeting', to=ZOOM))
+            for _ in range(200):
+                if supervisor._active_id is not None:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIsNotNone(supervisor._active_id)
+            checked = await harness.service.check(brief(channel='meeting', to=ZOOM))
+            self.assertEqual((checked['ok'], checked['problems']), (False, ['meeting agent is already running']))
+            with self.assertRaises(CallError) as caught:
+                await harness.service.create(brief(channel='meeting', to=ZOOM))
+            self.assertEqual((caught.exception.status, caught.exception.code), (409, 'capacity_exceeded'))
+            self.assertEqual(len(harness.store.list(limit=None)), 1)
             await harness.service.shutdown()
             app.runtime_daemon.close()
 

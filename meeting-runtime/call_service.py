@@ -29,6 +29,9 @@ STATUS_RANK = {
     'queued': 0, 'connecting': 1, 'ringing': 2, 'waiting': 2, 'in_progress': 3,
     'summarizing': 4, 'completed': 5, 'failed': 5, 'canceled': 5,
 }
+# Seconds a stop gives calls in progress to end (a phone call hangs up) and report what they
+# used before what is left is cut off (SMITLINE_SHUTDOWN_GRACE).
+SHUTDOWN_GRACE = 5.0
 # Notes for later calls: one note's length, and what one call may start with.
 MAX_NOTE = 1200
 MAX_CARRIED = 10
@@ -126,7 +129,7 @@ def note_line(item):
 
 class CallService:
     def __init__(self, store, *, hooks, lines, summarizer_factory=None, environ=None,
-                 price_check_delays=PRICE_CHECK_DELAYS):
+                 price_check_delays=PRICE_CHECK_DELAYS, shutdown_grace=SHUTDOWN_GRACE):
         self.store = store
         self.price_check_delays = tuple(price_check_delays)
         self._price_checked = set()
@@ -134,8 +137,10 @@ class CallService:
         self.lines = dict(lines or {})
         self._environ = environ
         self._summarizer_factory = summarizer_factory or self._default_summarizer
+        self.shutdown_grace = shutdown_grace
         self._contexts = {}
         self._tasks = set()
+        self._call_tasks = {}  # call id -> the task running it on its line
         self._changed = {}
         # Calls closed before they could finish (a stop, a restart): their usage is still
         # recorded, once each, so a hosted deployment settles what call_started held.
@@ -293,7 +298,9 @@ class CallService:
         await self._call_started(owner, record)
         context = CallContext(self, record['id'], brief, owner)
         self._contexts[record['id']] = context
-        self._spawn(self._run(start, context), name='call-' + record['id'])
+        task = self._spawn(self._run(start, context), name='call-' + record['id'])
+        self._call_tasks[record['id']] = task
+        task.add_done_callback(lambda _done, call_id=record['id']: self._call_tasks.pop(call_id, None))
         return record
 
     async def _call_started(self, owner, record):
@@ -871,6 +878,11 @@ class CallService:
                 await self.end(call_id, owner=self.store.get(call_id).get('owner'))
             except Exception:
                 pass
+        # Each line was asked to end its call (a phone call hangs up). Give them a moment to
+        # do so and report what the call used, then cut off what is left.
+        running = [task for task in map(self._call_tasks.get, active) if task is not None]
+        if running and self.shutdown_grace > 0:
+            await asyncio.wait(running, timeout=self.shutdown_grace)
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:

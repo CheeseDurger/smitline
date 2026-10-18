@@ -291,6 +291,15 @@ class ProductionMeetingSupervisor:
         signed-in browser profiles and the whole data volume, so local meetings only."""
         return self._claim is None
 
+    def capacity_problem(self, owner):
+        """Why a meeting for `owner` cannot start now, as (status, code, message), else None.
+        Asked when a meeting call is placed; start() still decides, for meetings that race."""
+        if self.local_only and owner != 'local':
+            return 409, 'meeting_pool_required', MEETING_POOL_REQUIRED
+        if self._active_id is not None:
+            return 409, 'capacity_exceeded', 'meeting agent is already running'
+        return None
+
     def _container_env(self, session, owner_env=None):
         state_path = meeting_state_path(self.runtime_root, session.id)
         env = {
@@ -857,19 +866,36 @@ class MeetingPool:
         self._prune()
         return tuple(self._meetings)
 
+    def _count_problem(self, owner):
+        """A full pool, or an owner at its cap, as (status, code, message); else None."""
+        if len(self._meetings) >= self.max_meetings:
+            return 409, 'capacity_exceeded', f'all {self.max_meetings} meeting agents are busy'
+        if owner != 'local' and self.per_owner is not None and sum(
+                1 for item in self._meetings.values() if item['owner'] == owner) >= self.per_owner:
+            return 409, 'owner_capacity_exceeded', f'this owner already has {self.per_owner} meetings running'
+        return None
+
+    def capacity_problem(self, owner):
+        """Why a meeting for `owner` cannot start now, as (status, code, message), else None.
+        Asked when a meeting call is placed; start() decides again, for meetings that race."""
+        self._prune()
+        problem = self._count_problem(owner)
+        if problem is None:
+            try:
+                self._allocate()
+            except DaemonError as error:
+                problem = error.status, error.code, error.message
+        return problem
+
     async def start(self, session, camera_settings=None):
         owner = getattr(session, 'owner', 'local')
         async with self._lock:
             self._prune()
             meeting = self._meetings.get(session.id)
             if meeting is None:
-                if len(self._meetings) >= self.max_meetings:
-                    raise DaemonError(409, 'capacity_exceeded',
-                                      f'all {self.max_meetings} meeting agents are busy')
-                if owner != 'local' and self.per_owner is not None and sum(
-                        1 for item in self._meetings.values() if item['owner'] == owner) >= self.per_owner:
-                    raise DaemonError(409, 'owner_capacity_exceeded',
-                                      f'this owner already has {self.per_owner} meetings running')
+                problem = self._count_problem(owner)
+                if problem:
+                    raise DaemonError(*problem)
                 meeting = self._meeting(session.id, owner, self._allocate())
             self._starting.add(session.id)
         try:

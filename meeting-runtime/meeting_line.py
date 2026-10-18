@@ -106,11 +106,15 @@ class MeetingLine:
         self._over_time = set()
 
     def ready(self, hooks, owner, brief):
-        # One meeting container at a time uses the installation's signed-in browser profiles
-        # and sees the whole data volume: it runs the local owner's meetings only.
-        if owner != LOCAL_OWNER and getattr(getattr(self.daemon, 'supervisor', None), 'local_only', False):
-            from meeting_supervisor import MEETING_POOL_REQUIRED
-            raise CallRefused('meeting_pool_required', MEETING_POOL_REQUIRED, status=409)
+        # No meeting container for it (the one container runs the local owner's meetings only,
+        # or is busy; the pool is full, or out of ports): refused now, with the code, rather
+        # than after the call was accepted. The supervisor checks again when it starts, for
+        # calls that race.
+        problem = getattr(getattr(self.daemon, 'supervisor', None), 'capacity_problem', None)
+        problem = problem(owner) if callable(problem) else None
+        if problem:
+            status, code, message = problem
+            raise CallRefused(code, message, status=status)
         hooks.credentials(owner, 'openai')
 
     def _now(self):
@@ -146,6 +150,8 @@ class MeetingLine:
                 if status:
                     ctx.set_status(status)
             if session.state == 'ended':
+                # Meeting time ends here, not when the handoff arrives up to a few minutes later.
+                ended = self._now()
                 break
             if started is not None and self._now() - started >= limit and ctx.call_id not in self._over_time:
                 self._over_time.add(ctx.call_id)
@@ -160,7 +166,7 @@ class MeetingLine:
             entries = []
         for entry in entries:
             ctx.add_transcript(entry['speaker'], entry['text'])
-        seconds = int(self._now() - started) if started is not None else 0
+        seconds = int(ended - started) if started is not None else 0
         if ctx.call_id in self._over_time:
             reason = 'max_duration'
         elif ctx.call_id in self._canceled:

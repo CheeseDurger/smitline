@@ -90,7 +90,8 @@ class GatedLine:
         self.ended.append(call_id)
         if not self.connect:
             return False
-        self.gate(call_id).set()
+        if getattr(self, 'ends_when_asked', True):
+            self.gate(call_id).set()
         return True
 
     async def transfer(self, call_id):
@@ -144,7 +145,8 @@ class OwnersDaemon:
                                  env_file=self.root / '.env', store=self.store, clock=DAYTIME)
         self.line = GatedLine()
         self.service = CallService(self.store, hooks=self.hooks, lines={'phone': self.line},
-                                   summarizer_factory=lambda owner: FakeSummarizer(), environ={})
+                                   summarizer_factory=lambda owner: FakeSummarizer(), environ={},
+                                   shutdown_grace=1.0)
         self.tokens = ApiTokenStore(self.root / 'api-tokens.json')
         self.internal, _ = self.tokens.create('gateway', kind='internal')
         self.standard, _ = self.tokens.create('script')
@@ -815,18 +817,58 @@ class UsageIsRecordedOnceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((record['status'], record['endReason']), ('failed', 'refused'))
         self.assertEqual((self.d.hooks.usage, self.d.line.contexts), ([], {}))
 
-    async def test_a_daemon_stop_during_a_call_still_records_its_usage_once(self):
+    async def test_a_daemon_stop_lets_calls_end_and_records_what_they_used(self):
         _, mine = await self.start('local')
         _, theirs = await self.start(A, to='+14155550150')
         await until(lambda: all(self.d.store.get(call['id'])['status'] == 'in_progress'
                                 for call in (mine, theirs)))
         await self.d.service.shutdown()
+        # Each line was asked to end its call and had time to report what it used.
         for call in (mine, theirs):
-            self.assertEqual(self.d.store.get(call['id'])['status'], 'failed')
-            self.assertEqual([(entry[0], entry[2]) for entry in self.usage_for(call['id'])],
-                             [(call['owner'], 'failed')])
+            self.assertEqual(self.d.store.get(call['id'])['status'], 'completed')
+            [(owner, _call_id, status, usage)] = self.usage_for(call['id'])
+            self.assertEqual((owner, status, usage['phoneSeconds']), (call['owner'], 'completed', 31))
         await self.d.service.shutdown()
         self.assertEqual(len(self.d.hooks.usage), 2)
+
+    async def test_a_call_that_does_not_end_within_the_grace_is_closed_and_recorded_once(self):
+        self.d.line.ends_when_asked = False
+        self.d.service.shutdown_grace = 0.3
+        _, call = await self.start(A)
+        await until(lambda: self.d.store.get(call['id'])['status'] == 'in_progress')
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await self.d.service.shutdown()
+        self.assertGreaterEqual(loop.time() - started, 0.3)
+        self.assertLess(loop.time() - started, 3)
+        self.assertEqual(self.d.store.get(call['id'])['status'], 'failed')
+        self.assertEqual([(entry[0], entry[2], entry[3]) for entry in self.usage_for(call['id'])],
+                         [(A, 'failed', {})])
+        await self.d.service.shutdown()
+        self.assertEqual(len(self.usage_for(call['id'])), 1)
+
+    def test_the_grace_is_five_seconds_unless_set(self):
+        from call_service import SHUTDOWN_GRACE
+        from daemon_main import shutdown_grace
+        self.assertEqual(SHUTDOWN_GRACE, 5.0)
+        self.assertEqual(shutdown_grace({}), 5.0)
+        self.assertEqual(shutdown_grace({'SMITLINE_SHUTDOWN_GRACE': '8'}), 8.0)
+        self.assertEqual(shutdown_grace({'SMITLINE_SHUTDOWN_GRACE': '0'}), 0.0)
+        for bad in ('-1', 'soon', 'nan', 'inf'):
+            self.assertEqual(shutdown_grace({'SMITLINE_SHUTDOWN_GRACE': bad}), 5.0, bad)
+
+    async def test_a_call_refused_at_start_does_not_count_toward_repeat_limits(self):
+        self.d.hooks._environ['SMITLINE_MAX_CALLS_PER_NUMBER'] = '1'
+        self.d.hooks.refuse_start = CallRefused('insufficient_credit', 'Top up to call.', status=402)
+        status, _ = await self.start(A)
+        self.assertEqual(status, 402)
+        # Topped up, the same call goes ahead: the refused one never rang anyone.
+        self.d.hooks.refuse_start = None
+        status, payload = await self.start(A)
+        self.assertEqual(status, 201, payload)
+        # The one that was placed counts.
+        status, payload = await self.start(A)
+        self.assertEqual((status, payload['error']['code']), (403, 'too_many_calls_to_number'))
 
     async def test_a_stop_while_the_result_is_written_keeps_the_line_usage(self):
         gate = asyncio.Event()
@@ -835,6 +877,7 @@ class UsageIsRecordedOnceTests(unittest.IsolatedAsyncioTestCase):
             async def summarize(self, brief, transcript, *, duration_seconds=0):
                 await gate.wait()
         self.d.service._summarizer_factory = lambda owner: Slow()
+        self.d.service.shutdown_grace = 0.3
         _, call = await self.start(A)
         self.d.line.gate(call['id']).set()
         await until(lambda: self.d.store.get(call['id'])['status'] == 'summarizing')

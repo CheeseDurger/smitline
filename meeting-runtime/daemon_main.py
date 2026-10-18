@@ -39,6 +39,18 @@ def build_parser():
     return parser
 
 
+def shutdown_grace(env):
+    """SMITLINE_SHUTDOWN_GRACE: seconds a stop gives calls in progress to end and report what
+    they used (default 5; 0 cuts them off at once)."""
+    import math
+    from call_service import SHUTDOWN_GRACE
+    try:
+        seconds = float(str(env.get('SMITLINE_SHUTDOWN_GRACE') or SHUTDOWN_GRACE).strip())
+    except ValueError:
+        return SHUTDOWN_GRACE
+    return seconds if math.isfinite(seconds) and seconds >= 0 else SHUTDOWN_GRACE
+
+
 def build_call_service(project_root, data_root, daemon, lines=None, gateway_port=None,
                        runtime_root=None):
     from call_hooks import load_hooks, read_env_file
@@ -67,7 +79,7 @@ def build_call_service(project_root, data_root, daemon, lines=None, gateway_port
     meeting = MeetingLine(daemon, transcript=lambda meeting_id: meeting_transcript(recordings, meeting_id))
     available = {'meeting': meeting, 'phone': phone}
     available.update(lines or {})
-    service = CallService(store, hooks=hooks, lines=available)
+    service = CallService(store, hooks=hooks, lines=available, shutdown_grace=shutdown_grace(startup_env))
     service.phone_line = phone
     service.public_url = public
     service.gateway_port = port

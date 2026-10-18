@@ -248,7 +248,7 @@
     "responses": {
       "Error": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "BriefProblem": { "description": "The brief is invalid or incomplete", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "Refused": { "description": "Refused by the guardrails, by the installation (409 meeting_pool_required: a meeting for an owner other than local needs SMITLINE_MAX_MEETINGS of 2 or more), or by the deployment's hooks, with details beside code and message where they help: a hosted deployment answers 402 (insufficient_credit with balance, affordableMinutes and topUpUrl; payment_required), 403 (verification_required with verifyUrl, spending_cap_reached, destination_not_allowed) or 429 (too_many_active_calls).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+      "Refused": { "description": "Refused by the guardrails, by the installation (409 capacity_exceeded or owner_capacity_exceeded when no meeting container can take the meeting now; 409 meeting_pool_required: a meeting for an owner other than local needs SMITLINE_MAX_MEETINGS of 2 or more), or by the deployment's hooks, with details beside code and message where they help: a hosted deployment answers 402 (insufficient_credit with balance, affordableMinutes and topUpUrl; payment_required), 403 (verification_required with verifyUrl, spending_cap_reached, destination_not_allowed) or 429 (too_many_active_calls).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
     },
     "schemas": {
       "Brief": {

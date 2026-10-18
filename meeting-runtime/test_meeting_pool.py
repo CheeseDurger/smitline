@@ -730,6 +730,97 @@ class OneContainerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((checked['ok'], checked['problems']), (True, []))
 
 
+class PoolCapacityTests(unittest.IsolatedAsyncioTestCase):
+    """A meeting the pool cannot run now is refused when the call is placed, with its code and
+    nothing recorded; the pool decides again at start, for calls that race."""
+
+    async def asyncSetUp(self):
+        from api_tokens import ApiTokenStore
+        from call_hooks import DefaultCallHooks
+        from call_store import CallStore
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.runtime = self.root / 'meeting-runtime'
+        self.runtime.mkdir()
+        self.store = CallStore(self.root / 'calls')
+        self.hooks = DefaultCallHooks(environ={'OPENAI_API_KEY': 'sk-test'}, store=self.store)
+        self.tokens = ApiTokenStore(self.root / 'api-tokens.json')
+        self.internal, _ = self.tokens.create('gateway', kind='internal')
+        self.launches = []
+        self.pools = []
+
+    async def asyncTearDown(self):
+        for pool in self.pools:
+            await pool.shutdown()
+        self.temporary.cleanup()
+
+    def pool(self, **options):
+        def launcher(project, env):
+            self.launches.append(project)
+            return FakeLauncher()
+        settings = dict(runtime_root=self.runtime, runner=ComposeRunner(), environ={}, max_meetings=2,
+                        ports=(18100, 18109), poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4,
+                        launcher_factory=launcher, health_factory=lambda port: FakeHealth(),
+                        port_free=lambda port: True)
+        settings.update(options)
+        pool = MeetingPool(self.root, **settings)
+        self.pools.append(pool)
+        return pool
+
+    async def running(self, pool, meeting_id, owner):
+        """A meeting already running in the pool."""
+        pool.bind_daemon(FakeDaemon())
+        await pool.start(owned(meeting_id, owner))
+
+    async def place(self, pool, owner):
+        """POST /v1/calls/check and /v1/calls for a meeting as `owner`, through a daemon whose
+        meetings go to `pool`."""
+        from aiohttp.test_utils import TestClient, TestServer
+        from call_service import CallService
+        from meeting_line import MeetingLine
+        from runtime_daemon import create_app
+        from test_call_service import ZOOM, FakeSummarizer
+        app = create_app(root=self.root / f'daemon-{id(pool)}', auth_token='launch-token', supervisor=pool,
+                         api_tokens=self.tokens, call_service_factory=lambda daemon: CallService(
+                             self.store, hooks=self.hooks, lines={'meeting': MeetingLine(daemon)},
+                             summarizer_factory=lambda name: FakeSummarizer(), environ={}, shutdown_grace=0))
+        pool.bind_daemon(app.runtime_daemon)
+        brief = {'channel': 'meeting', 'to': ZOOM, 'onBehalfOf': 'Ana', 'objective': 'Take notes'}
+        headers = {'Authorization': f'Bearer {self.internal}', 'X-Smitline-Owner': owner}
+        async with TestClient(TestServer(app)) as client:
+            checked = await (await client.post('/v1/calls/check', json=brief, headers=headers)).json()
+            if checked['ok']:
+                return checked, None, None
+            response = await client.post('/v1/calls', json=brief, headers=headers)
+            return checked, response.status, await response.json()
+
+    async def assert_refused(self, pool, owner, status, code, message):
+        launched = list(self.launches)
+        checked, got, payload = await self.place(pool, owner)
+        self.assertEqual((checked['ok'], checked['problems']), (False, [message]))
+        self.assertEqual((got, payload['error']['code'], payload['error']['message']), (status, code, message))
+        self.assertEqual(self.store.list(limit=None), [])
+        self.assertEqual(self.launches, launched)
+
+    async def test_a_full_pool_refuses_the_call_up_front(self):
+        pool = self.pool(max_meetings=1)
+        await self.running(pool, 'mtg-running000001', 'acct_b')
+        await self.assert_refused(pool, 'acct_a', 409, 'capacity_exceeded', 'all 1 meeting agents are busy')
+
+    async def test_an_owner_at_its_cap_is_refused_up_front_and_others_are_not(self):
+        pool = self.pool(max_meetings=3, per_owner=1)
+        await self.running(pool, 'mtg-running000001', 'acct_a')
+        await self.assert_refused(pool, 'acct_a', 409, 'owner_capacity_exceeded',
+                                  'this owner already has 1 meetings running')
+        checked, _status, _payload = await self.place(pool, 'acct_b')
+        self.assertEqual((checked['ok'], checked['problems']), (True, []))
+
+    async def test_no_free_ports_is_refused_up_front(self):
+        pool = self.pool(port_free=lambda port: False)
+        await self.assert_refused(pool, 'acct_a', 503, 'no_free_ports',
+                                  'no two free ports for a meeting in SMITLINE_MEETING_PORTS 18100-18109')
+
+
 class SettingsTests(unittest.TestCase):
     def test_one_meeting_at_a_time_is_the_default(self):
         self.assertEqual(pool_settings({}), {'max_meetings': 1, 'per_owner': None, 'ports': (18100, 18399)})
