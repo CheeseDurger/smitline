@@ -29,6 +29,10 @@ POOL_IMAGE_COMPOSE_FILE = 'compose.meeting.pool.image.yaml'
 POOL_PROJECT_PREFIX = 'smitline-meeting-'
 # Host ports the pool gives meetings, two each (noVNC, then /health), on 127.0.0.1.
 DEFAULT_POOL_PORTS = (18100, 18399)
+# One meeting container at a time uses the installation's signed-in browser profiles and sees
+# the whole data volume, so it runs the local owner's meetings only.
+MEETING_POOL_REQUIRED = ('Meetings for other owners need the meeting pool: set SMITLINE_MAX_MEETINGS '
+                         'to 2 or more.')
 SERVICE = 'meeting-agent'
 CODE_ROOT = Path(__file__).resolve().parent.parent
 # Bind-mount sources the container writes; Docker would create missing ones as root.
@@ -265,8 +269,10 @@ class ProductionMeetingSupervisor:
         self.poll_interval = poll_interval
         self.start_timeout = start_timeout
         self.stop_timeout = stop_timeout
-        # owner_environment(owner): what a meeting for that owner gets over the shared .env
-        # (its OpenAI key, voice, and name). The local owner's meetings read .env as always.
+        # owner_environment(owner): a pool meeting's whole environment besides HOME and its
+        # runtime state (meeting_line.pool_meeting_environment), written to a private env file
+        # that the pool's compose files read instead of .env. One meeting container at a time
+        # runs only the local owner's meetings, which read .env as always.
         self.owner_environment = owner_environment
         self.daemon = None
         self._lock = asyncio.Lock()
@@ -279,6 +285,12 @@ class ProductionMeetingSupervisor:
         self.daemon = daemon
         return self
 
+    @property
+    def local_only(self):
+        """One meeting container at a time (not one meeting of a pool): the installation's
+        signed-in browser profiles and the whole data volume, so local meetings only."""
+        return self._claim is None
+
     def _container_env(self, session, owner_env=None):
         state_path = meeting_state_path(self.runtime_root, session.id)
         env = {
@@ -287,18 +299,19 @@ class ProductionMeetingSupervisor:
             'SMITLINE_HOST_RUNTIME_STATE': str(state_path),
         }
         if owner_env is not None:
-            # The compose file reads it after .env and .env.meeting, so its values win.
+            # A pool meeting's compose file reads only this file for the container's settings.
             env['SMITLINE_MEETING_ENV_FILE'] = str(owner_env)
         return env
 
     def _owner_values(self, session):
-        """What the owner's settings give this meeting; nothing for the local owner."""
-        if self.owner_environment is None or getattr(session, 'owner', 'local') == 'local':
+        """A pool meeting's environment (every owner's, the local one's too); nothing for one
+        container at a time, whose local meetings read .env as always."""
+        if self.owner_environment is None or self.local_only:
             return {}
-        return dict(self.owner_environment(session.owner) or {})
+        return dict(self.owner_environment(getattr(session, 'owner', 'local')) or {})
 
     def _write_owner_env(self, session, values=None):
-        """The private env file for a meeting of an owner other than the local one, or None."""
+        """The private env file of a pool meeting, or None."""
         body = owner_env_file(self._owner_values(session) if values is None else values)
         if not body:
             return None
@@ -325,9 +338,10 @@ class ProductionMeetingSupervisor:
         payload = state_from_session(session)
         # Another owner's meeting joins under that owner's SMITLINE_PARTICIPANT_NAME; the local
         # owner's keeps the name it always had.
-        name = participant_name((owner_values or {}).get('SMITLINE_PARTICIPANT_NAME'))
-        if name:
-            payload['participantName'] = name
+        if getattr(session, 'owner', 'local') != 'local':
+            name = participant_name((owner_values or {}).get('SMITLINE_PARTICIPANT_NAME'))
+            if name:
+                payload['participantName'] = name
         if camera_settings:
             if 'cameraEnabled' in camera_settings:
                 payload['cameraEnabled'] = bool(camera_settings['cameraEnabled'])
@@ -345,6 +359,8 @@ class ProductionMeetingSupervisor:
         return payload
 
     async def start(self, session, camera_settings=None):
+        if self.local_only and getattr(session, 'owner', 'local') != 'local':
+            raise DaemonError(409, 'meeting_pool_required', MEETING_POOL_REQUIRED)
         async with self._lock:
             status = await self.launcher.inspect()
             if status.get('unknown'):
@@ -699,8 +715,11 @@ class MeetingPool:
     for any other owner, a folder of its own under .smitline/owners/<owner>/, so it joins as a
     guest. Each meeting has a ProductionMeetingSupervisor of its own, which follows it to its
     handoff exactly as the single supervisor does; the pool only hands out capacity, ports, and
-    claims (.smitline/active-meetings/<meeting id>.json).
+    claims (.smitline/active-meetings/<meeting id>.json). A meeting's container gets only the
+    environment owner_environment(owner) gives it (meeting_line.pool_meeting_environment).
     """
+    # Every owner's meetings may run here.
+    local_only = False
 
     def __init__(
         self,

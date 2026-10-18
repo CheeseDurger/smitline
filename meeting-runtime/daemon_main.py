@@ -173,8 +173,12 @@ def build_app(args):
         server_mode=args.server,
     )
     supervisor.bind_daemon(app.runtime_daemon)
-    from meeting_line import meeting_environment
-    supervisor.owner_environment = lambda owner: meeting_environment(app.call_service.hooks, owner)
+    if not supervisor.local_only:
+        # A pool meeting's container gets only what the meeting reads, never .env wholesale.
+        # One container at a time runs the local owner's meetings only, which read .env.
+        from meeting_line import pool_meeting_environment
+        supervisor.owner_environment = lambda owner: pool_meeting_environment(
+            app.call_service.hooks, owner, project_root / '.env.meeting')
     attach_phone_gateway(app, app.call_service)
     app.meeting_supervisor = supervisor
     app.auth_token_path = token_path

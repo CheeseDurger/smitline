@@ -11,11 +11,11 @@ services:
       dockerfile: Dockerfile.meeting
     user: "${SMITLINE_UID:-1000}:${SMITLINE_GID:-1000}"
     env_file:
-      - path: .env
-      - path: .env.meeting
-        required: false
-      # The owner's settings for this meeting (OpenAI key, voice, name), when it has any.
-      - path: ${SMITLINE_MEETING_ENV_FILE:-.env.meeting}
+      # Only what the meeting reads, written by the daemon for this meeting just before it
+      # starts: its OpenAI key and the meeting settings listed in meeting_line.py. Never the
+      # installation's settings files, so no provider key or other secret reaches it. Stopping
+      # or listing the container needs none (/dev/null).
+      - path: ${SMITLINE_MEETING_ENV_FILE:-/dev/null}
         required: false
     environment:
       HOME: /tmp

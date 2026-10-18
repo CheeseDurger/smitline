@@ -188,27 +188,28 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_each_owner_key_reaches_only_its_own_meeting(self):
         gate = asyncio.Event()
-        keys = {'acct_a': 'sk-proj-aaaa', 'acct_b': 'sk-proj-bbbb'}
+        keys = {'acct_a': 'sk-proj-aaaa', 'acct_b': 'sk-proj-bbbb', 'local': 'sk-proj-llll'}
         self.pool = self.make_pool(max_meetings=3, launcher_factory=self.slow(gate),
                                    owner_environment=lambda owner: {
                                        'OPENAI_API_KEY': keys[owner], 'SMITLINE_OWNER_NAME': owner.upper()})
-        meetings = [owned('mtg-owner0000000a', 'acct_a'), owned('mtg-owner0000000b', 'acct_b'),
-                    session(id='mtg-local00000001')]
-        starts = [asyncio.create_task(self.pool.start(meeting)) for meeting in meetings]
-        await until(lambda: len(self.launchers) == 3 and all(
-            launcher.env_file or launcher.project.endswith('local00000001') for launcher in self.launchers.values()))
+        meetings = {'acct_a': owned('mtg-owner0000000a', 'acct_a'), 'acct_b': owned('mtg-owner0000000b', 'acct_b'),
+                    'local': session(id='mtg-local00000001')}
+        starts = [asyncio.create_task(self.pool.start(meeting)) for meeting in meetings.values()]
+        await until(lambda: len(self.launchers) == 3 and all(launcher.env_file for launcher in self.launchers.values()))
         gate.set()
         await asyncio.gather(*starts)
-        for owner, meeting in (('acct_a', meetings[0]), ('acct_b', meetings[1])):
+        # Every pool meeting, the local owner's too, gets its own file and nothing of the others'.
+        for owner, meeting in meetings.items():
             path, body, mode = self.launchers['smitline-meeting-' + meeting.id].env_file
             self.assertEqual(mode, 0o600)
             self.assertIn(f'OPENAI_API_KEY="{keys[owner]}"', body)
-            self.assertNotIn(keys['acct_b' if owner == 'acct_a' else 'acct_a'], body)
+            for other, key in keys.items():
+                if other != owner:
+                    self.assertNotIn(key, body)
             self.assertIn(f'SMITLINE_OWNER_NAME="{owner.upper()}"', body)
             # The file sits in the meeting's own folder and is gone once compose read it.
             self.assertEqual(Path(path).parent.name, meeting.id)
             self.assertFalse(Path(path).exists())
-        self.assertIsNone(self.launchers['smitline-meeting-mtg-local00000001'].env_file)
         self.assertEqual(list(self.root.rglob('owner.env')), [])
 
     async def test_the_key_file_is_removed_when_compose_fails(self):
@@ -460,6 +461,273 @@ class PoolComposeTests(unittest.IsolatedAsyncioTestCase):
                         'SMITLINE_MEETING_RUN_DIR', 'SMITLINE_MEETING_RECORDINGS_DIR',
                         'SMITLINE_MEETING_PROFILES_DIR', 'SMITLINE_MEETING_ENV_FILE'):
                 self.assertIn(key, text, (name, key))
+
+
+    def test_pool_compose_files_read_no_installation_env(self):
+        for name in ('compose.meeting.pool.yaml', 'compose.meeting.pool.image.yaml'):
+            if not (CODE_ROOT / name).is_file():
+                self.skipTest('the compose files are not in the meeting image')
+            text = (CODE_ROOT / name).read_text()
+            # Only the meeting's own env file: never .env or .env.meeting wholesale.
+            self.assertNotIn('/.env', text, name)
+            self.assertNotIn('path: .env', text, name)
+            self.assertIn('path: ${SMITLINE_MEETING_ENV_FILE', text, name)
+
+
+# Values an installation keeps in .env (and in the daemon's own environment) that no meeting
+# container may ever see: provider keys, SIP and webhook secrets, the hosted service's token,
+# phone numbers, and anything else that happens to be there.
+INSTALLATION_SECRETS = {
+    'TWILIO_ACCOUNT_SID': 'AC-test-account-sid-not-real', 'TWILIO_AUTH_TOKEN': 'tw-auth-secret',
+    'TWILIO_FROM_NUMBER': '+15005550006', 'SIGNALWIRE_SPACE': 'secret-space',
+    'SIGNALWIRE_PROJECT_ID': 'sw-project-secret', 'SIGNALWIRE_API_TOKEN': 'PTsw-token-secret',
+    'SIGNALWIRE_FROM_NUMBER': '+15005550007', 'SIGNALWIRE_SIGNING_KEY': 'PSKsw-signing-secret',
+    'SMITLINE_SIP_TRUNK_URL': 'sip:trunk-secret@sip.example.com', 'SMITLINE_SIP_USERNAME': 'sip-user-secret',
+    'SMITLINE_SIP_PASSWORD': 'sip-password-secret', 'OPENAI_WEBHOOK_SECRET': 'whsec_openai-secret',
+    'OPENAI_PROJECT_ID': 'proj_openai-secret', 'SMITLINE_CLOUD_API': 'http://cloud-api-secret:8080',
+    'SMITLINE_CLOUD_INTERNAL_TOKEN': 'cloud-internal-secret', 'SMITLINE_CALL_HOOKS': 'secret_hooks:create',
+    'SMITLINE_NOTIFY_WEBHOOK': 'https://hooks.example.com/notify-secret',
+    'SMITLINE_PUBLIC_URL': 'https://public-secret.example.com', 'SMITLINE_CALLER_ID': '+15005550008',
+    'SMITLINE_OWNER_PHONE': '+14155550111', 'AWS_SECRET_ACCESS_KEY': 'aws-secret-value',
+    'GITHUB_TOKEN': 'ghp_github-secret', 'DATABASE_PASSWORD': 'db-password-secret',
+}
+
+
+class PoolEnvironmentTests(unittest.IsolatedAsyncioTestCase):
+    """A pool meeting's container gets the OpenAI key and the settings the meeting reads, and
+    nothing else of the installation's .env, .env.meeting, or the daemon's environment."""
+
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.runtime = self.root / 'meeting-runtime'
+        self.runtime.mkdir()
+        dotenv = {**INSTALLATION_SECRETS, 'OPENAI_API_KEY': 'sk-proj-installation',
+                  'SMITLINE_VOICE': 'cinder', 'SMITLINE_OWNER_NAME': 'Robin',
+                  'SMITLINE_PARTICIPANT_NAME': "Robin's notetaker",
+                  'SMITLINE_MEETING_BACKEND_MODEL': 'gpt-5.6-terra', 'SMITLINE_MEETING_INTRO': '0'}
+        (self.root / '.env').write_text(''.join(f'{key}={value}\n' for key, value in dotenv.items()))
+        (self.root / '.env.meeting').write_text(
+            'SMITLINE_MEETING_INSTRUCTIONS=Take notes only.\nSMITLINE_VOICE=quartz\n'
+            'MEETING_URL=https://zoom.us/j/111111111\nMEETING_PASSCODE=passcode-secret\n'
+            'SMITLINE_AUTH_MODE=google\nSIGNALWIRE_API_TOKEN=PTsw-in-env-meeting-secret\n')
+        from call_hooks import DefaultCallHooks
+        self.hooks = DefaultCallHooks(
+            environ={'SMITLINE_CLOUD_INTERNAL_TOKEN': 'cloud-internal-from-process-secret',
+                     'SMITLINE_MEETING_CAMERA_STYLE': 'animated'},
+            env_file=self.root / '.env')
+        self.launchers = {}
+
+        def launcher(project, env):
+            fake = SlowLauncher()
+            fake.project, fake.env = project, env
+            self.launchers[project] = fake
+            return fake
+        from meeting_line import pool_meeting_environment
+        self.pool = MeetingPool(
+            self.root, runtime_root=self.runtime, runner=ComposeRunner(), environ={}, max_meetings=3,
+            ports=(18100, 18109), poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4,
+            launcher_factory=launcher, health_factory=lambda port: FakeHealth(), port_free=lambda port: True,
+            owner_environment=lambda owner: pool_meeting_environment(
+                self.hooks, owner, self.root / '.env.meeting'),
+        ).bind_daemon(FakeDaemon())
+
+    async def asyncTearDown(self):
+        await self.pool.shutdown()
+        self.temporary.cleanup()
+
+    async def container_env(self, meeting):
+        from test_owner_isolation import parse_env_file
+        await self.pool.start(meeting)
+        captured = self.launchers['smitline-meeting-' + meeting.id].env_file
+        self.assertIsNotNone(captured, f'{meeting.owner} meeting got no env file of its own')
+        path, body, mode = captured
+        self.assertEqual(mode, 0o600)
+        self.assertFalse(Path(path).exists())
+        for name, value in INSTALLATION_SECRETS.items():
+            self.assertNotIn(value, body, name)
+        for leaked in ('cloud-internal-from-process-secret', 'passcode-secret', 'PTsw-in-env-meeting-secret',
+                       'MEETING_URL', 'SMITLINE_AUTH_MODE'):
+            self.assertNotIn(leaked, body)
+        return parse_env_file(body)
+
+    async def test_no_installation_secret_reaches_a_pool_meeting(self):
+        from meeting_line import POOL_MEETING_SETTINGS
+        mine = await self.container_env(session(id='mtg-local00000001'))
+        theirs = await self.container_env(owned('mtg-owner0000000a', 'acct_a'))
+        allowed = set(POOL_MEETING_SETTINGS) | {'OPENAI_API_KEY'}
+        self.assertLessEqual(set(mine), allowed)
+        self.assertLessEqual(set(theirs), allowed)
+        # The local owner's meeting reads what one container at a time would: .env, then
+        # .env.meeting over it, plus the daemon's own environment for the allowed settings.
+        self.assertEqual(mine, {
+            'OPENAI_API_KEY': 'sk-proj-installation', 'SMITLINE_VOICE': 'quartz',
+            'SMITLINE_OWNER_NAME': 'Robin', 'SMITLINE_PARTICIPANT_NAME': "Robin's notetaker",
+            'SMITLINE_MEETING_BACKEND_MODEL': 'gpt-5.6-terra', 'SMITLINE_MEETING_INTRO': '0',
+            'SMITLINE_MEETING_INSTRUCTIONS': 'Take notes only.', 'SMITLINE_MEETING_CAMERA_STYLE': 'animated'})
+        # Another owner's per-owner settings come from its own settings, never .env.meeting.
+        self.assertEqual(theirs['SMITLINE_VOICE'], 'cinder')
+        self.assertEqual(theirs['SMITLINE_MEETING_INSTRUCTIONS'], 'Take notes only.')
+        # The local owner's meetings still join as Smitline; another owner's under its name.
+        names = {meeting_id: read_json(self.runtime / 'run' / 'meetings' / meeting_id / 'runtime.json')['participantName']
+                 for meeting_id in ('mtg-local00000001', 'mtg-owner0000000a')}
+        self.assertEqual(names, {'mtg-local00000001': 'Smitline', 'mtg-owner0000000a': "Robin's notetaker"})
+
+    def test_the_meeting_reads_nothing_outside_its_allowlist(self):
+        from meeting_line import POOL_MEETING_SETTINGS
+        reads = meeting_environment_reads()
+        allowed = set(POOL_MEETING_SETTINGS) | {'OPENAI_API_KEY'}
+        known = allowed | MEETING_ENV_SET_INSIDE | MEETING_ENV_NOT_IN_THE_POOL
+        unknown = {name: places for name, places in reads.items() if name not in known}
+        self.assertEqual(unknown, {}, 'the meeting reads a variable the pool does not pass: add it to '
+                                      'POOL_MEETING_SETTINGS (meeting_line.py) or to the lists here')
+        self.assertEqual(allowed - set(reads), set(), 'POOL_MEETING_SETTINGS names a variable nothing reads')
+
+
+# What the meeting container sets for itself (or compose sets), and what only a meeting
+# started by hand or a sign-in reads: none of it comes from the installation's settings.
+MEETING_ENV_SET_INSIDE = {'SMITLINE_RUNTIME_STATE', 'DISPLAY', 'WAYLAND_DISPLAY', 'XDG_SESSION_TYPE',
+                          'PULSE_SOURCE', 'PULSE_SERVER', 'JOINLY_BROWSER_PROFILE_DIR', 'JOINLY_NAME'}
+MEETING_ENV_NOT_IN_THE_POOL = {
+    'MEETING_URL', 'MEETING_PASSCODE',  # a meeting started by hand (.env.meeting); calls use the runtime state
+    'SMITLINE_AUTH_MODE',               # signing the bot in, one container at a time
+    'SMITLINE_ROOT',                    # preflight.py, which runs on the host
+}
+# Imported by the meeting for constants and types; it never runs their environment reads.
+DAEMON_ONLY_MODULES = {'call_hooks.py', 'call_policy.py'}
+
+
+def meeting_environment_reads():
+    """{variable: [file:line]} for every environment variable read by code the meeting
+    container runs: bridge.py (and the sign-in helpers) and what they import from
+    meeting-runtime/ and joinly/."""
+    import ast
+    import importlib.util
+    runtime = Path(__file__).resolve().parent
+    spec = importlib.util.find_spec('joinly')
+    joinly_root = Path(spec.origin).parent.parent if spec and spec.origin else runtime.parent / 'joinly'
+    roots = (runtime, joinly_root)
+
+    def resolve(name):
+        for root in roots:
+            for candidate in (root.joinpath(*name.split('.')).with_suffix('.py'),
+                              root.joinpath(*name.split('.'), '__init__.py')):
+                if candidate.is_file():
+                    return candidate
+        return None
+    queue = [runtime / name for name in ('bridge.py', 'google_account.py', 'teams_account.py')]
+    seen = set()
+    while queue:
+        path = queue.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names = [node.module] + [f'{node.module}.{alias.name}' for alias in node.names]
+            queue += [found for found in map(resolve, names) if found is not None]
+    upper = lambda node: (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                          and node.value.isupper() and len(node.value) > 2)
+    envish = lambda node: 'env' in ast.unparse(node).lower()
+    reads = {}
+    for path in sorted(seen):
+        if path.name in DAEMON_ONLY_MODULES:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            name = None
+            if isinstance(node, ast.Call) and node.args and upper(node.args[0]) and (
+                    envish(node.func) or ast.unparse(node.func) in ('getenv', 'os.getenv')):
+                name = node.args[0].value
+            elif isinstance(node, ast.Subscript) and upper(node.slice) and envish(node.value):
+                name = node.slice.value
+            elif isinstance(node, ast.Compare) and upper(node.left) and \
+                    any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops) and \
+                    any(envish(comparator) for comparator in node.comparators):
+                name = node.left.value
+            if name:
+                reads.setdefault(name, []).append(f'{path.name}:{node.lineno}')
+    return reads
+
+
+class OneContainerTests(unittest.IsolatedAsyncioTestCase):
+    """One meeting container at a time (SMITLINE_MAX_MEETINGS=1) uses the installation's
+    signed-in browser profiles and sees the whole data volume, so it runs the local owner's
+    meetings only; another owner's need the pool."""
+
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.runtime = self.root / 'meeting-runtime'
+        self.runtime.mkdir()
+        self.launcher = FakeLauncher()
+        self.supervisor = ProductionMeetingSupervisor(
+            self.root, runtime_root=self.runtime, launcher=self.launcher, health=FakeHealth(),
+            poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4,
+            owner_environment=lambda owner: {'OPENAI_API_KEY': 'sk-proj-owner'}).bind_daemon(FakeDaemon())
+
+    async def asyncTearDown(self):
+        await self.supervisor.shutdown()
+        self.temporary.cleanup()
+
+    async def test_the_single_container_refuses_another_owner_meeting(self):
+        with self.assertRaises(DaemonError) as raised:
+            await self.supervisor.start(owned('mtg-owner0000000a', 'acct_a'))
+        self.assertEqual((raised.exception.status, raised.exception.code), (409, 'meeting_pool_required'))
+        self.assertIn('SMITLINE_MAX_MEETINGS', raised.exception.message)
+        self.assertEqual(self.launcher.ups, [])
+        self.assertFalse(active_meeting_path(self.root).exists())
+        self.assertEqual(list(self.runtime.rglob('*.json')) + list(self.runtime.rglob('*.env')), [])
+        # The local owner's meetings run exactly as before: no env file of their own.
+        await self.supervisor.start(session())
+        self.assertNotIn('SMITLINE_MEETING_ENV_FILE', self.launcher.ups[0])
+        await self.supervisor.cancel(session().id)
+
+    async def test_calls_and_checks_refuse_it_before_anything_starts(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        from api_tokens import ApiTokenStore
+        from call_hooks import DefaultCallHooks
+        from call_service import CallService
+        from call_store import CallStore
+        from meeting_line import MeetingLine
+        from runtime_daemon import create_app
+        from test_call_service import ZOOM, FakeSummarizer
+        store = CallStore(self.root / 'calls')
+        hooks = DefaultCallHooks(environ={'OPENAI_API_KEY': 'sk-test'}, store=store)
+        tokens = ApiTokenStore(self.root / 'api-tokens.json')
+        internal, _ = tokens.create('gateway', kind='internal')
+        brief = {'channel': 'meeting', 'to': ZOOM, 'onBehalfOf': 'Ana', 'objective': 'Take notes'}
+
+        async def ask(supervisor, owner, start=False):
+            """POST /v1/calls/check (and /v1/calls when start) as the owner, through a daemon
+            whose meetings go to `supervisor`."""
+            app = create_app(root=self.root / f'daemon-{id(supervisor)}', auth_token='launch-token',
+                             supervisor=supervisor, api_tokens=tokens, call_service_factory=lambda daemon: CallService(
+                                 store, hooks=hooks, lines={'meeting': MeetingLine(daemon)},
+                                 summarizer_factory=lambda name: FakeSummarizer(), environ={}))
+            supervisor.bind_daemon(app.runtime_daemon)
+            headers = {'Authorization': 'Bearer launch-token'} if owner == 'local' else \
+                {'Authorization': f'Bearer {internal}', 'X-Smitline-Owner': owner}
+            async with TestClient(TestServer(app)) as client:
+                checked = await (await client.post('/v1/calls/check', json=brief, headers=headers)).json()
+                if not start:
+                    return checked, None
+                started = await client.post('/v1/calls', json=brief, headers=headers)
+                return checked, (started.status, await started.json())
+        message = 'Meetings for other owners need the meeting pool: set SMITLINE_MAX_MEETINGS to 2 or more.'
+        checked, (status, payload) = await ask(self.supervisor, 'acct_a', start=True)
+        self.assertEqual((checked['ok'], checked['problems']), (False, [message]))
+        self.assertEqual((status, payload['error']), (409, {'code': 'meeting_pool_required', 'message': message}))
+        self.assertEqual(store.list(limit=None), [])
+        self.assertEqual(self.launcher.ups, [])
+        checked, _ = await ask(self.supervisor, 'local')
+        self.assertEqual((checked['ok'], checked['problems']), (True, []))
+        # With the pool (or SMITLINE_REQUIRE_OWNER=1, which always uses it) the same meeting is fine.
+        pool = MeetingPool(self.root, runtime_root=self.runtime, runner=ComposeRunner(), environ={})
+        checked, _ = await ask(pool, 'acct_a')
+        self.assertEqual((checked['ok'], checked['problems']), (True, []))
 
 
 class SettingsTests(unittest.TestCase):
