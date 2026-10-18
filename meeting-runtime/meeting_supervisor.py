@@ -889,8 +889,11 @@ class MeetingPool:
         await self.runner.run(['docker', 'compose', '-p', name, 'down', '--remove-orphans'], env=None)
 
     async def reconcile(self, daemon=None):
-        """After a restart: follow every pool meeting still running and remove every other pool
-        container, then write the handoff of meetings that no container is running any more."""
+        """After a restart: follow every pool meeting of this installation still running and
+        remove its other pool containers, then write the handoff of meetings that no container
+        is running any more. A pool container whose meeting this installation does not know
+        (no meeting record, no claim) belongs to another installation on the same Docker host,
+        such as a test copy or a hosted deployment, and is left alone."""
         daemon = daemon or self.daemon
         if daemon is None:
             return
@@ -902,18 +905,21 @@ class MeetingPool:
             meeting_id = name[len(POOL_PROJECT_PREFIX):]
             session = None
             claim = {}
+            known = False
             try:
                 claim = read_json(pool_claim_path(self.project_root, meeting_id)) or {}
                 record = daemon.meetings.get(meeting_id)
+                known = record is not None or bool(claim)
                 session = None if record is None or record.session.state == 'ended' else record.session
             except Exception:
                 session = None
+            if not known:
+                continue
             ports = claim.get('ports') or {}
             if running and session is not None and claim.get('meetingId') == meeting_id \
                     and isinstance(ports.get('vnc'), int) and isinstance(ports.get('health'), int):
                 async with self._lock:
-                    meeting = self._meeting(meeting_id, claim.get('owner') or session.owner,
-                                            (ports['vnc'], ports['health']))
+                    meeting = self._meeting(meeting_id, session.owner, (ports['vnc'], ports['health']))
                 meeting['supervisor'].adopt(session)
                 adopted.add(meeting_id)
             else:

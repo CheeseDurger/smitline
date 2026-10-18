@@ -20,6 +20,44 @@ def owned(meeting_id, owner):
     return MeetingSession.from_dict(dict(session(id=meeting_id).to_dict(), owner=owner))
 
 
+async def until(predicate, timeout=3.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError('condition not met in time')
+        await asyncio.sleep(0.005)
+
+
+class SlowLauncher(FakeLauncher):
+    """compose up and down that take their time, so starts and stops overlap. Records the
+    owner env file as compose would read it, while it exists."""
+
+    def __init__(self, up_gate=None, stop_gate=None, fail_up=False):
+        super().__init__()
+        self.up_gate, self.stop_gate, self.fail_up = up_gate, stop_gate, fail_up
+        self.stopping = False
+        self.env_file = None
+
+    async def up(self, env):
+        path = env.get('SMITLINE_MEETING_ENV_FILE')
+        if path:
+            self.env_file = (path, Path(path).read_text(), file_mode(Path(path)))
+        if self.up_gate is not None:
+            await self.up_gate.wait()
+        await super().up(env)
+
+    async def stop(self):
+        self.stopping = True
+        if self.stop_gate is not None:
+            await self.stop_gate.wait()
+        await super().stop()
+
+
+def pair(launcher):
+    return int(launcher.env['SMITLINE_MEETING_VNC_PORT']), int(launcher.env['SMITLINE_MEETING_HEALTH_PORT'])
+
+
 class ComposeRunner:
     """Answers `docker compose ls` with the given projects and records every command."""
 
@@ -63,6 +101,145 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.pool.shutdown()
         self.temporary.cleanup()
+
+    def slow(self, up_gate=None, stop_gate=None, fail_up=False):
+        def launcher(project, env):
+            fake = SlowLauncher(up_gate, stop_gate, fail_up)
+            fake.project, fake.env = project, env
+            self.launchers[project] = fake
+            return fake
+        return launcher
+
+    async def test_meetings_started_at_the_same_time_never_share_ports(self):
+        gate = asyncio.Event()
+        self.pool = self.make_pool(max_meetings=6, ports=(18100, 18199), launcher_factory=self.slow(gate))
+        self.busy = {18102, 18105}
+        meetings = [session(id=f'mtg-race{index:012x}') for index in range(6)]
+        starts = [asyncio.create_task(self.pool.start(meeting)) for meeting in meetings]
+        # Every meeting has its ports while every compose up is still running.
+        await until(lambda: len(self.launchers) == 6)
+        gate.set()
+        await asyncio.gather(*starts)
+        pairs = [pair(launcher) for launcher in self.launchers.values()]
+        ports = [port for both in pairs for port in both]
+        self.assertEqual(len(set(ports)), 12, pairs)
+        self.assertFalse(set(ports) & self.busy)
+        claimed = [tuple(read_json(pool_claim_path(self.root, meeting.id))['ports'].values()) for meeting in meetings]
+        self.assertEqual(sorted(claimed), sorted(pairs))
+
+    async def test_ports_and_capacity_stay_taken_until_the_container_is_gone(self):
+        stop_gate = asyncio.Event()
+        self.pool = self.make_pool(max_meetings=2, ports=(18100, 18103),
+                                   launcher_factory=self.slow(stop_gate=stop_gate))
+        first, second, third = (session(id='mtg-first00000001'), session(id='mtg-second0000001'),
+                                session(id='mtg-third00000001'))
+        await self.pool.start(first)
+        first_launcher = self.launchers['smitline-meeting-' + first.id]
+        canceling = asyncio.create_task(self.pool.cancel(first.id))
+        await until(lambda: first_launcher.stopping)
+        # While the first container is still being removed, its ports and its place are taken.
+        await self.pool.start(second)
+        self.assertNotEqual(pair(self.launchers['smitline-meeting-' + second.id]), pair(first_launcher))
+        with self.assertRaises(DaemonError) as raised:
+            await self.pool.start(third)
+        self.assertEqual(raised.exception.code, 'capacity_exceeded')
+        stop_gate.set()
+        await canceling
+        await self.pool.start(third)
+        self.assertEqual(pair(self.launchers['smitline-meeting-' + third.id]), pair(first_launcher))
+
+    async def test_a_meeting_that_ends_by_itself_frees_its_ports_after_its_container(self):
+        stop_gate = asyncio.Event()
+        health = {}
+
+        def health_for(port):
+            health[port] = FakeHealth()
+            return health[port]
+        self.pool = self.make_pool(max_meetings=2, ports=(18100, 18103), health_factory=health_for,
+                                   launcher_factory=self.slow(stop_gate=stop_gate))
+        first, second, third = (session(id='mtg-first00000001'), session(id='mtg-second0000001'),
+                                session(id='mtg-third00000001'))
+        self.daemon.meetings.records[first.id] = FakeRecord(first)
+        await self.pool.start(first)
+        first_launcher = self.launchers['smitline-meeting-' + first.id]
+        health[pair(first_launcher)[1]].payload = {'stage': 'finished'}
+        await until(lambda: first_launcher.stopping)
+        await self.pool.start(second)
+        self.assertNotEqual(pair(self.launchers['smitline-meeting-' + second.id]), pair(first_launcher))
+        stop_gate.set()
+        await until(lambda: self.pool.active_ids() == (second.id,))
+        self.assertFalse(pool_claim_path(self.root, first.id).exists())
+        await self.pool.start(third)
+        self.assertEqual(pair(self.launchers['smitline-meeting-' + third.id]), pair(first_launcher))
+
+    async def test_the_owner_cap_holds_when_an_owner_starts_two_at_once(self):
+        gate = asyncio.Event()
+        self.pool = self.make_pool(max_meetings=4, per_owner=1, launcher_factory=self.slow(gate))
+        meetings = [owned('mtg-owner0000000a', 'acct_a'), owned('mtg-owner0000000b', 'acct_a')]
+        starts = [asyncio.create_task(self.pool.start(meeting)) for meeting in meetings]
+        await until(lambda: any(task.done() for task in starts))
+        gate.set()
+        results = await asyncio.gather(*starts, return_exceptions=True)
+        refused = [result for result in results if isinstance(result, DaemonError)]
+        self.assertEqual([error.code for error in refused], ['owner_capacity_exceeded'])
+        self.assertEqual(len(self.launchers), 1)
+        self.assertEqual(len(self.pool.active_ids()), 1)
+        self.assertEqual(sum(pool_claim_path(self.root, meeting.id).exists() for meeting in meetings), 1)
+
+    async def test_each_owner_key_reaches_only_its_own_meeting(self):
+        gate = asyncio.Event()
+        keys = {'acct_a': 'sk-proj-aaaa', 'acct_b': 'sk-proj-bbbb'}
+        self.pool = self.make_pool(max_meetings=3, launcher_factory=self.slow(gate),
+                                   owner_environment=lambda owner: {
+                                       'OPENAI_API_KEY': keys[owner], 'SMITLINE_OWNER_NAME': owner.upper()})
+        meetings = [owned('mtg-owner0000000a', 'acct_a'), owned('mtg-owner0000000b', 'acct_b'),
+                    session(id='mtg-local00000001')]
+        starts = [asyncio.create_task(self.pool.start(meeting)) for meeting in meetings]
+        await until(lambda: len(self.launchers) == 3 and all(
+            launcher.env_file or launcher.project.endswith('local00000001') for launcher in self.launchers.values()))
+        gate.set()
+        await asyncio.gather(*starts)
+        for owner, meeting in (('acct_a', meetings[0]), ('acct_b', meetings[1])):
+            path, body, mode = self.launchers['smitline-meeting-' + meeting.id].env_file
+            self.assertEqual(mode, 0o600)
+            self.assertIn(f'OPENAI_API_KEY="{keys[owner]}"', body)
+            self.assertNotIn(keys['acct_b' if owner == 'acct_a' else 'acct_a'], body)
+            self.assertIn(f'SMITLINE_OWNER_NAME="{owner.upper()}"', body)
+            # The file sits in the meeting's own folder and is gone once compose read it.
+            self.assertEqual(Path(path).parent.name, meeting.id)
+            self.assertFalse(Path(path).exists())
+        self.assertIsNone(self.launchers['smitline-meeting-mtg-local00000001'].env_file)
+        self.assertEqual(list(self.root.rglob('owner.env')), [])
+
+    async def test_the_key_file_is_removed_when_compose_fails(self):
+        self.pool = self.make_pool(launcher_factory=self.slow(fail_up=True),
+                                   owner_environment=lambda owner: {'OPENAI_API_KEY': 'sk-proj-secret'})
+        meeting = owned('mtg-owner0000000a', 'acct_a')
+        with self.assertRaises(RuntimeError):
+            await self.pool.start(meeting)
+        path, body, mode = self.launchers['smitline-meeting-' + meeting.id].env_file
+        self.assertEqual(mode, 0o600)
+        self.assertIn('sk-proj-secret', body)
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(list(self.root.rglob('owner.env')), [])
+        self.assertEqual(self.pool.active_ids(), ())
+        self.assertFalse(pool_claim_path(self.root, meeting.id).exists())
+
+    async def test_the_real_port_probe_skips_a_port_in_use(self):
+        import socket
+        from meeting_supervisor import port_is_free
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            held.bind(('127.0.0.1', 0))
+            held.listen()
+            port = held.getsockname()[1]
+            self.assertFalse(port_is_free(port))
+            self.pool = self.make_pool(ports=(port, port + 1), port_free=port_is_free)
+            with self.assertRaises(DaemonError) as raised:
+                await self.pool.start(session())
+            self.assertEqual(raised.exception.code, 'no_free_ports')
+        self.assertTrue(port_is_free(port))
+        await self.pool.start(session())
+        self.assertEqual(pair(self.launchers['smitline-meeting-' + session().id]), (port, port + 1))
 
     async def test_each_meeting_gets_its_own_project_ports_and_claim(self):
         first, second = session(id='mtg-first00000001'), session(id='mtg-second0000001')
@@ -156,7 +333,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 outside._mount_env('mtg-owner0000000a', 'acct_a', (18100, 18101))
 
-    async def test_reconcile_follows_live_meetings_and_removes_every_other_container(self):
+    async def test_reconcile_follows_live_meetings_and_removes_only_its_own_other_containers(self):
         live, gone, unclaimed = (session(id='mtg-live000000001'), session(id='mtg-gone000000001'),
                                  session(id='mtg-unclaimed0001'))
         for meeting in (live, gone, unclaimed):
@@ -166,17 +343,27 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
             'ports': {'vnc': 18104, 'health': 18105}})
         write_private_json(pool_claim_path(self.root, gone.id), {
             'meetingId': gone.id, 'ports': {'vnc': 18106, 'health': 18107}})
+        # A claim of this installation whose meeting record is gone: still this installation's.
+        write_private_json(pool_claim_path(self.root, 'mtg-orphan0000001'), {
+            'meetingId': 'mtg-orphan0000001', 'ports': {'vnc': 18108, 'health': 18109}})
         self.runner.projects = [
             {'Name': 'smitline-meeting-' + live.id, 'Status': 'running(1)'},
             {'Name': 'smitline-meeting-' + gone.id, 'Status': 'exited(0)'},
             {'Name': 'smitline-meeting-' + unclaimed.id, 'Status': 'running(1)'},
+            {'Name': 'smitline-meeting-mtg-orphan0000001', 'Status': 'running(1)'},
+            # Another installation's meetings on the same Docker host (a test copy, a hosted
+            # deployment beside a personal one) are never this daemon's to remove.
+            {'Name': 'smitline-meeting-mtg-elsewhere00001', 'Status': 'running(1)'},
+            {'Name': 'smitline-meeting-not-a-meeting', 'Status': 'running(1)'},
             {'Name': 'smitline', 'Status': 'running(1)'},
         ]
         self.pool = self.make_pool()
         await self.pool.reconcile(self.daemon)
         downs = [call for call in self.runner.calls if 'down' in call]
         self.assertEqual(sorted(call[3] for call in downs),
-                         ['smitline-meeting-' + gone.id, 'smitline-meeting-' + unclaimed.id])
+                         ['smitline-meeting-' + gone.id, 'smitline-meeting-mtg-orphan0000001',
+                          'smitline-meeting-' + unclaimed.id])
+        self.assertFalse(pool_claim_path(self.root, 'mtg-orphan0000001').exists())
         # The single meeting container's project is never touched.
         self.assertFalse(any('smitline' == call[3] for call in downs if len(call) > 3))
         self.assertEqual(self.pool.active_ids(), (live.id,))

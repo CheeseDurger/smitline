@@ -253,7 +253,7 @@ Phone callbacks are checked with the credentials of the call's owner, and an inc
 - It mounts only its own `run/meetings/<id>` and `recordings/<id>` folders and its owner's browser profiles: the installation's signed-in profiles for `local`, and for any other owner `.smitline/owners/<owner>/meeting-profiles`, empty unless that owner signs in, so it joins as a guest. It never sees other meetings, other owners, `.env` or `.smitline/`. The published image mounts these as subpaths of the data volume, which needs Docker Engine 26 or later.
 - Each running meeting's claim (owner, project, ports) is `.smitline/active-meetings/<meeting id>.json`.
 - A full pool answers `409 capacity_exceeded`. `SMITLINE_MAX_MEETINGS_PER_OWNER` caps the meetings of each owner other than `local` (`409 owner_capacity_exceeded`); unset, owners share the pool.
-- At startup the daemon follows every pool meeting whose container is still running and whose meeting has not ended, removes every other `smitline-meeting-*` project, and writes the handoff of meetings no container is running any more.
+- At startup the daemon follows every pool meeting whose container is still running and whose meeting has not ended, removes its other `smitline-meeting-*` projects, and writes the handoff of meetings no container is running any more. A `smitline-meeting-*` project whose meeting it does not know belongs to another installation on the same Docker host and is left alone.
 
 ## Access
 
