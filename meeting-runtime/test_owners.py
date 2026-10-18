@@ -58,7 +58,8 @@ class TwoOwners:
                                  notifier=self.notifier, clock=DAYTIME)
         self.line = FakeLine()
         self.service = CallService(self.store, hooks=self.hooks, lines={'phone': self.line},
-                                   summarizer_factory=lambda owner: FakeSummarizer(), environ={})
+                                   summarizer_factory=lambda owner: FakeSummarizer(), environ={},
+                                   shutdown_grace=0.2)
         self.tokens = ApiTokenStore(self.root / 'api-tokens.json')
         self.internal, _ = self.tokens.create('gateway', kind='internal')
         self.standard, _ = self.tokens.create('script')

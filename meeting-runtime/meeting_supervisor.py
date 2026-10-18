@@ -230,6 +230,13 @@ class ProductionMeetingSupervisor:
         self.daemon = daemon
         return self
 
+    def capacity_problem(self, owner):
+        """Why a meeting for `owner` cannot start now, as (status, code, message), else None.
+        Asked when a meeting call is placed; start() still decides, for meetings that race."""
+        if self._active_id is not None:
+            return 409, 'capacity_exceeded', 'meeting agent is already running'
+        return None
+
     def _container_env(self, session, owner_env=None):
         state_path = meeting_state_path(self.runtime_root, session.id)
         env = {

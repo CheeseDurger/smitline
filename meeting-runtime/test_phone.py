@@ -191,7 +191,8 @@ class PhoneHarness:
                               twilio_factory=lambda creds: self.twilio,
                               live_factory=FakeLive, status_grace=0.2)
         self.service = CallService(self.store, hooks=self.hooks, lines={'phone': self.line},
-                                   summarizer_factory=lambda owner: FakeSummarizer(), environ={})
+                                   summarizer_factory=lambda owner: FakeSummarizer(), environ={},
+                                   shutdown_grace=0.2)
 
     async def dial(self, **overrides):
         record = await self.service.create(brief(**overrides))
@@ -1465,6 +1466,65 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post_signed('/twilio/inbound', {**first, 'CallSid': 'CA2'})
         self.assertIn('<Reject reason="busy"/>', await response.text())
         self.assertEqual(len(self.h.service.list(owner='local')), 1)
+
+
+class ConnectedTimeTests(unittest.IsolatedAsyncioTestCase):
+    """phoneSeconds is every connected call's connected time: the provider's, from its status
+    callback, when that arrives; else measured here, from when the media stream connected to
+    when it ended. Incoming calls never get a status callback."""
+
+    async def asyncSetUp(self):
+        FakeLive.instances = []
+        FakeSummarizer.calls = 0
+        self.temp = tempfile.TemporaryDirectory()
+        self.h = PhoneHarness(self.temp.name, env={**ENV, 'SMITLINE_ACCEPT_INBOUND': '1'})
+        app = create_gateway_app(self.h.line, self.h.service, current_url=lambda: PUBLIC)
+        self.client = TestClient(TestServer(app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        await self.h.service.shutdown()
+        self.temp.cleanup()
+
+    async def talk(self, record, session, seconds):
+        """Connect the media stream, as if it connected `seconds` ago, and hang up."""
+        ws = FakeTwilioSocket()
+        self.assertIs(self.h.line.claim(record['id'], session.token), session)
+        task = asyncio.create_task(session.run(ws, {'streamSid': 'MZ1', 'callSid': session.call_sid}))
+        await until(lambda: FakeLive.instances and FakeLive.instances[-1] is session.live)
+        session.started_at -= seconds
+        ws.push({'event': 'stop'})
+        await asyncio.wait_for(task, 3)
+
+    async def test_an_incoming_call_measures_its_connected_time(self):
+        params = {'CallSid': 'CA9', 'From': '+14155550142', 'To': '+15005550006'}
+        signed = compute_signature('tw-secret', PUBLIC + '/twilio/inbound', params)
+        response = await self.client.post('/twilio/inbound', data=params, headers={'X-Twilio-Signature': signed})
+        self.assertIn('<Connect>', await response.text())
+        [record] = self.h.service.list(owner='local')
+        await self.talk(record, self.h.line.session(record['id']), 42.4)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
+        self.assertEqual((done['direction'], done['usage']['phoneSeconds']), ('inbound', 42))
+
+    async def test_an_outbound_call_whose_status_never_arrives_measures_it_too(self):
+        record, session = await self.h.dial()
+        await self.talk(record, session, 42.4)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
+        self.assertEqual(done['usage']['phoneSeconds'], 42)
+
+    async def test_the_provider_duration_wins_when_it_arrives(self):
+        record, session = await self.h.dial()
+        await self.talk(record, session, 42.4)
+        self.h.line.on_status(record['id'], {'CallStatus': 'completed', 'CallDuration': '45'})
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
+        self.assertEqual(done['usage']['phoneSeconds'], 45)
+
+    async def test_a_call_that_never_connected_has_no_connected_time(self):
+        record, _session = await self.h.dial()
+        self.h.line.on_status(record['id'], {'CallStatus': 'no-answer', 'CallDuration': '0'})
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
+        self.assertEqual(done['usage'].get('phoneSeconds'), 0)
 
 
 class SignalWireTests(unittest.IsolatedAsyncioTestCase):

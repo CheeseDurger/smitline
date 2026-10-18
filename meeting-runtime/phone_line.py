@@ -455,6 +455,7 @@ class PhoneSession:
         self._dropped_at = None
         self.last_activity = None
         self.started_at = None
+        self.stream_ended_at = None
         self._hanging_up = False
         self._closing_stream = False
         self._tasks = set()
@@ -551,6 +552,7 @@ class PhoneSession:
             finally:
                 await manager.__aexit__(None, None, None)
         finally:
+            self.stream_ended_at = time.monotonic()
             for speaker, text in self.joiner.flush():
                 self.ctx.add_transcript(speaker, text)
                 if speaker == 'agent':
@@ -562,6 +564,13 @@ class PhoneSession:
                 await asyncio.wait(list(self._hangups), timeout=5)
             self._write_trace()
             self.finished.set()
+
+    def connected_seconds(self):
+        """Connected time measured here: from when the media stream connected to its end."""
+        if self.started_at is None:
+            return None
+        ended = self.stream_ended_at if self.stream_ended_at is not None else time.monotonic()
+        return max(0, int(ended - self.started_at))
 
     async def _bridge(self, live):
         self.live = live
@@ -1441,11 +1450,16 @@ class PhoneLine:
             pass
 
     async def _finish(self, ctx, session):
-        if session.phone_seconds is None and session.connected.is_set():
+        # The provider reports an outbound call's connected time in its status callback; an
+        # incoming call gets no status callback, so it is not waited for.
+        if session.phone_seconds is None and session.connected.is_set() and not session.inbound:
             try:
                 await asyncio.wait_for(self._await_duration(session), self.status_grace)
             except asyncio.TimeoutError:
                 pass
+        if session.phone_seconds is None and session.connected.is_set():
+            # No word from the provider: the connected time as measured here.
+            session.phone_seconds = session.connected_seconds()
         reason = session.end_reason or ('canceled' if session.canceled else 'hangup')
         error = session.error_detail if reason == 'error' else None
         usage = self._usage(session)

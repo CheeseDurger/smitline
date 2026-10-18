@@ -144,11 +144,20 @@ def _in_hours(delta):
     return 'in about an hour' if hours == 1 else f'in about {hours} hours'
 
 
+def never_placed(record):
+    """A finished call that never reached the phone provider: refused when it started (no
+    credit, say), or failed or canceled before it was dialed. Nobody's phone rang."""
+    if record.get('status') not in ('completed', 'failed', 'canceled'):
+        return False
+    line = record.get('line') or {}
+    return record.get('endReason') == 'refused' or not (line.get('providerCallSid') or line.get('liveSessionId'))
+
+
 def check_repeats(number, records, now, env, *, own_number=False):
     """Limit calls to one number per 24 hours, and outbound calls per hour.
 
-    `records` are earlier calls; rehearsals and incoming calls do not count. The owner's own
-    phone has no per-number limit.
+    `records` are earlier calls; rehearsals, incoming calls, and calls that never reached the
+    phone provider do not count. The owner's own phone has no per-number limit.
     """
     per_number = _limit(env, 'SMITLINE_MAX_CALLS_PER_NUMBER', DEFAULT_MAX_PER_NUMBER)
     per_hour = _limit(env, 'SMITLINE_MAX_CALLS_PER_HOUR', DEFAULT_MAX_PER_HOUR)
@@ -157,7 +166,7 @@ def check_repeats(number, records, now, env, *, own_number=False):
     for record in records:
         brief = record.get('brief') or {}
         if record.get('channel') != 'phone' or record.get('direction') != 'outbound' or \
-                brief.get('rehearsal'):
+                brief.get('rehearsal') or never_placed(record):
             continue
         created = _created(record)
         if created is None:
