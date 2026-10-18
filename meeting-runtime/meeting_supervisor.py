@@ -44,13 +44,15 @@ COMPLETE_REASONS = frozenset({'finished', 'meeting_ended'})
 
 
 def owner_env_file(values):
-    """KEY='value' lines, which compose reads literally; a value it could not read that way
-    (a quote, a control character) is left out."""
+    """KEY='value' lines, which compose reads literally. Every key is written: a value it
+    could not read that way (a quote, a control character), or none, is blank, so the shared
+    .env read before this file never fills in for the owner."""
     lines = []
     for key, value in values.items():
         value = str(value or '')
-        if value and "'" not in value and not any(ord(char) < 32 for char in value):
-            lines.append(f"{key}='{value}'")
+        if "'" in value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            value = ''
+        lines.append(f"{key}='{value}'")
     return ''.join(line + '\n' for line in lines)
 
 

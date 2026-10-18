@@ -77,6 +77,8 @@ npm test
 cd packages/sdk-python && python3 -m unittest discover -s tests
 ```
 
+`scripts/smoke-owners.sh smitline:local` checks owner scoping on a built smitline image over real HTTP (server mode, `SMITLINE_REQUIRE_OWNER=1`, two owners); it places no calls, needs no keys or Docker socket, and removes its throwaway container and volume. CI runs it on every pull request.
+
 Unit tests do not establish live admission, audio quality, or phone behavior. Test those with a real call or meeting after changing browser, audio, or phone code.
 
 ## README images

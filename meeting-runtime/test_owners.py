@@ -527,8 +527,9 @@ class MeetingOwnerEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mode, 0o600)
         self.assertIn("OPENAI_API_KEY='sk-shared'\n", body)
         self.assertIn("SMITLINE_VOICE='cedar'\n", body)
-        # A value compose could not read literally is left out rather than mangled.
-        self.assertNotIn('OWNER_NAME', body)
+        # A value compose could not read literally is blank rather than mangled, and never
+        # left to the shared .env, whose value is another owner's.
+        self.assertIn("SMITLINE_OWNER_NAME=''\n", body)
         self.assertFalse(Path(self.launcher.ups[0]['SMITLINE_MEETING_ENV_FILE']).exists())
         await self.supervisor.cancel(meeting.id)
 

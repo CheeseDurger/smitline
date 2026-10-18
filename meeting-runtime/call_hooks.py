@@ -204,18 +204,22 @@ class DefaultCallHooks:
         """The owner a request acts for, from the credential the daemon verified.
 
         An internal API token names the owner with X-Smitline-Owner; a token created with
-        an owner always acts as it; everything else is the local owner.
+        an owner always acts as it, whatever its kind; everything else is the local owner.
         """
         auth = request.get('smitline_auth') if hasattr(request, 'get') else None
         token = (auth or {}).get('token') or {}
+        bound = token.get('owner')
         named = (getattr(request, 'headers', None) or {}).get(OWNER_HEADER)
         if named is not None:
             if token.get('kind') != 'internal':
                 raise CallRefused('owner_header_forbidden', f'Only an internal API token may '
                                   f'send {OWNER_HEADER}.', status=403)
             owner = named.strip()
+            if bound and owner != bound:
+                raise CallRefused('owner_header_forbidden', 'This API token acts for its own '
+                                  'owner only.', status=403)
         else:
-            owner = token.get('owner') or LOCAL_OWNER
+            owner = bound or LOCAL_OWNER
         if not valid_owner(owner):
             raise CallRefused('invalid_owner', 'An owner id is lowercase letters, digits, _ and -, '
                               'at most 64 characters.', status=400)
