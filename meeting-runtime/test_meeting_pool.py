@@ -390,6 +390,34 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.reconcile(self.daemon)
         self.assertEqual(self.daemon.handoffs, [])
 
+    async def test_reconcile_removes_nothing_when_docker_answers_nonsense(self):
+        class Garbled(ComposeRunner):
+            async def run(self, args, *, env=None):
+                self.calls.append(list(args))
+                return CommandResult(0, 'WARN[0000] not json', '')
+        meeting = session()
+        self.daemon.meetings.records[meeting.id] = FakeRecord(meeting)
+        runner = Garbled()
+        self.pool = self.make_pool(runner=runner)
+        await self.pool.reconcile(self.daemon)
+        self.assertFalse(any('down' in call for call in runner.calls))
+        self.assertEqual(self.daemon.handoffs, [])
+
+    async def test_reconcile_removes_its_container_when_the_meeting_record_is_unreadable(self):
+        class Unreadable(type(self.daemon.meetings)):
+            def get(self, meeting_id):
+                raise ValueError('corrupt snapshot')
+        write_private_json(pool_claim_path(self.root, 'mtg-corrupt000001'), {
+            'meetingId': 'mtg-corrupt000001', 'ports': {'vnc': 18100, 'health': 18101}})
+        self.daemon.meetings = Unreadable()
+        self.runner.projects = [{'Name': 'smitline-meeting-mtg-corrupt000001', 'Status': 'running(1)'},
+                                {'Name': 'smitline-meeting-mtg-elsewhere00001', 'Status': 'running(1)'}]
+        self.pool = self.make_pool()
+        await self.pool.reconcile(self.daemon)
+        downs = [call[3] for call in self.runner.calls if 'down' in call]
+        self.assertEqual(downs, ['smitline-meeting-mtg-corrupt000001'])
+        self.assertEqual(self.pool.active_ids(), ())
+
     async def test_context_and_cancel_of_a_meeting_without_a_container(self):
         meeting = session()
         self.daemon.meetings.records[meeting.id] = FakeRecord(meeting)

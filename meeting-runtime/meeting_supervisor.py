@@ -908,8 +908,9 @@ class MeetingPool:
             known = False
             try:
                 claim = read_json(pool_claim_path(self.project_root, meeting_id)) or {}
+                known = bool(claim)
                 record = daemon.meetings.get(meeting_id)
-                known = record is not None or bool(claim)
+                known = known or record is not None
                 session = None if record is None or record.session.state == 'ended' else record.session
             except Exception:
                 session = None
