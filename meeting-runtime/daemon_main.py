@@ -133,6 +133,19 @@ def attach_phone_gateway(app, service):
     app.on_cleanup.append(stop_gateway)
 
 
+def build_supervisor(project_root, runtime_root, environ=None):
+    """One meeting container at the fixed ports (SMITLINE_MAX_MEETINGS=1, the default), or a
+    pool of them. A deployment that serves accounts (SMITLINE_REQUIRE_OWNER=1) always uses the
+    pool, which keeps each meeting's folders and browser profiles apart."""
+    from call_hooks import owner_required, read_env_file
+    from meeting_supervisor import MeetingPool, pool_settings
+    env = environ if environ is not None else {**read_env_file(project_root / '.env'), **os.environ}
+    settings = pool_settings(env)
+    if settings['max_meetings'] == 1 and not owner_required(env):
+        return ProductionMeetingSupervisor(project_root, runtime_root=runtime_root)
+    return MeetingPool(project_root, runtime_root=runtime_root, **settings)
+
+
 def build_app(args):
     project_root = Path(args.root).resolve()
     old_names.migrate_data(project_root)
@@ -147,7 +160,7 @@ def build_app(args):
     def publish_auth_token(current_token):
         write_private_file(token_path, current_token + '\n')
 
-    supervisor = ProductionMeetingSupervisor(project_root, runtime_root=runtime_root)
+    supervisor = build_supervisor(project_root, runtime_root)
     app = create_app(
         root=data_root,
         bind_host=host,

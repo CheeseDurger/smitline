@@ -53,6 +53,8 @@ One image, `ghcr.io/kaelorlabs/smitline-meeting` (`Dockerfile.meeting`, about 1.
 
 A meeting for an [owner](calls.md#owners) other than `local` gets that owner's OpenAI key, voice and name: the daemon writes them to a private file named by `SMITLINE_MEETING_ENV_FILE`, which both compose files read after `.env` and `.env.meeting`, and deletes it once the container is created.
 
+With `SMITLINE_MAX_MEETINGS` above 1 (see [calls](calls.md#several-meetings-at-once)), each meeting gets a container of its own in its own compose project, `smitline-meeting-<meeting id>`, on two ports from `SMITLINE_MEETING_PORTS`, mounting only that meeting's run and recording folders and its owner's browser profiles (`compose.meeting.pool.yaml`, `compose.meeting.pool.image.yaml`).
+
 From a checkout, the daemon uses `compose.meeting.yaml` instead: it builds `smitline-meeting:local` and mounts `meeting-runtime/` and `joinly/` read-only, so code changes need no rebuild.
 
 `.github/workflows/images.yml` runs the tests on every pull request and push to `main` (including the runtime suite inside the meeting image and a start of the smitline image). A version tag such as `v0.1.0` also publishes both images, for `linux/amd64` and `linux/arm64`, tagged with the version, `latest`, and `sha-<commit>`; the smitline image starts the meeting image with the same `sha-` tag.
@@ -155,7 +157,8 @@ In the image, the `.smitline/` and `.env` paths below are under `/data`, and the
 | Daemon auth token | `.smitline/daemon.auth` | Stop the daemon; deleting the file forces a new token on next start |
 | Daemon meetings, events, call records, webhook secret, API token digests | `.smitline/daemon-data/` | Stop the daemon, then delete the directory |
 | Owner profile | `.smitline/profile.json` | `smitline profile`, or delete the file |
-| Other owners' profiles, contacts, do-not-call lists and webhook secrets | `.smitline/owners/<owner>/` | Delete the owner's directory |
+| Other owners' profiles, contacts, do-not-call lists, webhook secrets and meeting browser profiles | `.smitline/owners/<owner>/` | Delete the owner's directory |
+| Running pool meetings (several meetings at once) | `.smitline/active-meetings/` | Removed as each meeting ends, and at startup |
 | Do-not-call list | `.smitline/do-not-call.json` | `smitline do-not-call remove <number>`, or delete the file |
 | Contacts: names, notes, automatic context | `.smitline/contacts.json` | Console **Forget**, `smitline contacts forget <number>`, or delete the file |
 | Remote connector grants (digests) | `.smitline/connector/` | `smitline connector revoke --all`, or delete the directory |

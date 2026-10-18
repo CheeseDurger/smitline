@@ -1,0 +1,45 @@
+# One meeting of several (SMITLINE_MAX_MEETINGS above 1) when Smitline runs from its published
+# image. The runtime daemon (meeting_supervisor.py) runs each meeting as its own compose project,
+# smitline-meeting-<id>, on ports it picked. Instead of the whole data volume, it mounts only this
+# meeting's folders and its owner's browser profiles, as subpaths of the volume (Docker Engine
+# 26 or later). One meeting at a time uses compose.meeting.image.yaml.
+services:
+  meeting-agent:
+    image: ${SMITLINE_MEETING_IMAGE:?set by the smitline image}
+    user: "${SMITLINE_UID:-1001}:${SMITLINE_GID:-1001}"
+    env_file:
+      - path: ${SMITLINE_ROOT:-/data}/.env
+      - path: ${SMITLINE_ROOT:-/data}/.env.meeting
+        required: false
+      # The owner's settings for this meeting (OpenAI key, voice, name), when it has any.
+      - path: ${SMITLINE_MEETING_ENV_FILE:-${SMITLINE_ROOT:-/data}/.env.meeting}
+        required: false
+    environment:
+      HOME: /tmp
+      SMITLINE_RUNTIME_STATE: ${SMITLINE_RUNTIME_STATE:-}
+    shm_size: "2gb"
+    ports:
+      - "127.0.0.1:${SMITLINE_MEETING_VNC_PORT:?set by the runtime daemon}:6080"
+      - "127.0.0.1:${SMITLINE_MEETING_HEALTH_PORT:?set by the runtime daemon}:8094"
+    volumes:
+      # /meeting-runtime/run, recordings and profiles are links into /data/meetings.
+      - type: volume
+        source: data
+        target: /data/meetings/run/meetings/${SMITLINE_MEETING_ID:?}
+        volume:
+          subpath: ${SMITLINE_MEETING_RUN_DIR:?}
+      - type: volume
+        source: data
+        target: /data/meetings/recordings/${SMITLINE_MEETING_ID:?}
+        volume:
+          subpath: ${SMITLINE_MEETING_RECORDINGS_DIR:?}
+      - type: volume
+        source: data
+        target: /data/meetings/profiles
+        volume:
+          subpath: ${SMITLINE_MEETING_PROFILES_DIR:?}
+    stop_grace_period: 25s
+volumes:
+  data:
+    external: true
+    name: ${SMITLINE_VOLUME:-smitline}

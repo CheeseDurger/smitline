@@ -1,0 +1,37 @@
+# One meeting of several (SMITLINE_MAX_MEETINGS above 1), from a checkout. The runtime daemon
+# (meeting_supervisor.py) runs each meeting as its own compose project, smitline-meeting-<id>,
+# on ports it picked, and mounts only that meeting's folders and its owner's browser profiles:
+# the rest of meeting-runtime/ (other meetings, recordings, profiles) is hidden. The published
+# image uses compose.meeting.pool.image.yaml; one meeting at a time uses compose.meeting.yaml.
+services:
+  meeting-agent:
+    image: smitline-meeting:local
+    build:
+      context: .
+      dockerfile: Dockerfile.meeting
+    user: "${SMITLINE_UID:-1000}:${SMITLINE_GID:-1000}"
+    env_file:
+      - path: .env
+      - path: .env.meeting
+        required: false
+      # The owner's settings for this meeting (OpenAI key, voice, name), when it has any.
+      - path: ${SMITLINE_MEETING_ENV_FILE:-.env.meeting}
+        required: false
+    environment:
+      HOME: /tmp
+      SMITLINE_RUNTIME_STATE: ${SMITLINE_RUNTIME_STATE:-}
+    shm_size: "2gb"
+    ports:
+      - "127.0.0.1:${SMITLINE_MEETING_VNC_PORT:?set by the runtime daemon}:6080"
+      - "127.0.0.1:${SMITLINE_MEETING_HEALTH_PORT:?set by the runtime daemon}:8094"
+    tmpfs:
+      - /meeting-runtime/run
+      - /meeting-runtime/recordings
+      - /meeting-runtime/context
+    volumes:
+      - ./meeting-runtime:/meeting-runtime:ro
+      - ./joinly:/opt/joinly:ro
+      - ${SMITLINE_MEETING_RUN_DIR:?}:/meeting-runtime/run/meetings/${SMITLINE_MEETING_ID:?}
+      - ${SMITLINE_MEETING_RECORDINGS_DIR:?}:/meeting-runtime/recordings/${SMITLINE_MEETING_ID:?}
+      - ${SMITLINE_MEETING_PROFILES_DIR:?}:/meeting-runtime/profiles
+    stop_grace_period: 25s

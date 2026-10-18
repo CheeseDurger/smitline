@@ -21,7 +21,9 @@ from meeting_line import meeting_environment
 from meeting_repository import MeetingRepository
 from meeting_supervisor import ProductionMeetingSupervisor
 from phone_gateway import create_gateway_app
+from runtime_config import RuntimeConfig
 from runtime_daemon import DaemonError, create_app
+from runtime_state import meeting_state_path, read_json
 from test_briefing import PROFILE
 from test_call_core import at, phone_brief, placed_at
 from test_call_service import DAYTIME, ZOOM, FakeLine, FakeSummarizer, RecordingNotifier, brief
@@ -509,7 +511,8 @@ class MeetingOwnerEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 await super().up(env)
         self.launcher = Launcher()
         hooks = DefaultCallHooks(environ={'OPENAI_API_KEY': 'sk-shared', 'SMITLINE_VOICE': 'cedar',
-                                          'SMITLINE_OWNER_NAME': "Ana O'Neil"})
+                                          'SMITLINE_OWNER_NAME': "Ana O'Neil",
+                                          'SMITLINE_PARTICIPANT_NAME': "Ana's assistant"})
         self.supervisor = ProductionMeetingSupervisor(
             root, runtime_root=self.runtime, launcher=self.launcher, health=FakeHealth(),
             poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4,
@@ -525,11 +528,17 @@ class MeetingOwnerEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         await self.supervisor.start(meeting)
         [(body, mode)] = self.seen
         self.assertEqual(mode, 0o600)
-        self.assertIn("OPENAI_API_KEY='sk-shared'\n", body)
-        self.assertIn("SMITLINE_VOICE='cedar'\n", body)
-        # A value compose could not read literally is left out rather than mangled.
-        self.assertNotIn('OWNER_NAME', body)
+        self.assertIn('OPENAI_API_KEY="sk-shared"\n', body)
+        self.assertIn('SMITLINE_VOICE="cedar"\n', body)
+        self.assertIn('SMITLINE_OWNER_NAME="Ana O\'Neil"\n', body)
         self.assertFalse(Path(self.launcher.ups[0]['SMITLINE_MEETING_ENV_FILE']).exists())
+        # The owner's participant name reaches the meeting's runtime state, which the
+        # container reads over its environment.
+        state = read_json(meeting_state_path(self.runtime, meeting.id))
+        self.assertEqual(state['participantName'], "Ana's assistant")
+        self.assertEqual(RuntimeConfig.from_environ({
+            'SMITLINE_RUNTIME_STATE': str(meeting_state_path(self.runtime, meeting.id))}).participant_name,
+            "Ana's assistant")
         await self.supervisor.cancel(meeting.id)
 
     async def test_the_local_owner_meeting_reads_the_shared_env(self):
@@ -537,7 +546,14 @@ class MeetingOwnerEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         await self.supervisor.start(meeting)
         self.assertNotIn('SMITLINE_MEETING_ENV_FILE', self.launcher.ups[0])
         self.assertEqual(self.seen, [])
+        state = read_json(meeting_state_path(self.runtime, meeting.id))
+        self.assertEqual(state['participantName'], 'Smitline')
         await self.supervisor.cancel(meeting.id)
+
+    def test_env_file_values_arrive_exactly(self):
+        from meeting_supervisor import owner_env_file
+        body = owner_env_file({'A': "O'Neil", 'B': 'say "hi" \\ $HOME', 'C': 'two\nlines', 'D': ''})
+        self.assertEqual(body, 'A="O\'Neil"\nB="say \\"hi\\" \\\\ \\$HOME"\n')
 
 
 if __name__ == '__main__':
