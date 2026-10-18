@@ -860,6 +860,111 @@ class UsageIsRecordedOnceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.usage_for(left['id'])), 1)
 
 
+class UsageFailureAndStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_failing_record_usage_never_breaks_the_call_or_its_webhook(self):
+        with tempfile.TemporaryDirectory() as temp:
+            d = await OwnersDaemon(temp, hooks_class=Counting).start()
+            try:
+                def broken(owner, call, usage):
+                    raise ConnectionError('ledger down')
+                d.hooks.record_usage = broken
+                response = await d.client.post('/v1/calls', json=brief(), headers=d.as_owner(A))
+                call = await response.json()
+                d.line.gate(call['id']).set()
+                done = await d.service.wait(call['id'], owner=A, timeout=5)
+                self.assertEqual(done['status'], 'completed')
+                await until(lambda: d.hooks.notified)
+                events = [event['type'] for event in d.store.events(call['id'])]
+                self.assertIn('call.usage_failed', events)
+                self.assertEqual(d.hooks.notified, [(A, call['id'])])
+            finally:
+                await d.close()
+
+    def test_calls_left_open_before_the_event_loop_runs_are_recorded_at_shutdown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = CallStore(Path(temp) / 'calls')
+            hooks = Counting(environ={'OPENAI_API_KEY': 'sk-test'}, store=store, clock=DAYTIME)
+            service = CallService(store, hooks=hooks, lines={'phone': GatedLine()},
+                                  summarizer_factory=lambda owner: FakeSummarizer(), environ={})
+            now = store.now()
+            left = store.create({'version': 1, 'id': new_call_id(), 'owner': A, 'channel': 'phone',
+                                 'direction': 'outbound', 'status': 'ringing', 'brief': brief(),
+                                 'createdAt': now, 'updatedAt': now, 'line': {}, 'result': None,
+                                 'usage': {}})
+            self.assertEqual(service.reconcile(), [left['id']])
+            self.assertEqual(hooks.usage, [])
+            asyncio.run(service.shutdown())
+            self.assertEqual([(owner, call_id) for owner, call_id, _, _ in hooks.usage], [(A, left['id'])])
+
+    def test_listing_calls_needs_an_owner(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = CallStore(Path(temp) / 'calls')
+            service = CallService(store, hooks=DefaultCallHooks(environ={}), lines={}, environ={})
+            with self.assertRaises(ValueError):
+                service.list(owner=None)
+            with self.assertRaises(TypeError):
+                service.get('call-0000000000000000')
+
+    def test_the_token_cli_refuses_an_invalid_owner_or_kind(self):
+        import contextlib
+        import io
+        from api_tokens import main as tokens_main
+        with tempfile.TemporaryDirectory() as temp:
+            for args in (['--owner', '../escape'], ['--owner', 'Acct'], ['--owner', 'a' * 65]):
+                errors = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+                    code = tokens_main(['--root', temp, 'create', '--name', 'x', *args])
+                self.assertEqual(code, 2, args)
+                self.assertIn('owner must be', errors.getvalue())
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                tokens_main(['--root', temp, 'create', '--name', 'x', '--kind', 'root'])
+            self.assertEqual(list(Path(temp).rglob('api-tokens.json')), [])
+
+
+class OneContactBookTests(unittest.IsolatedAsyncioTestCase):
+    """Hooks written before owners keep one contact book, as an attribute: it is the local
+    owner's, and no other owner reads or changes it."""
+
+    async def test_a_single_contact_book_is_the_local_owner_only(self):
+        from contacts import ContactBook
+
+        class Older(DefaultCallHooks):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.contact_book = ContactBook(Path(kwargs['env_file']).parent / 'book.json')
+        with tempfile.TemporaryDirectory() as temp:
+            d = await OwnersDaemon(temp, hooks_class=Older).start()
+            try:
+                response = await d.client.patch('/v1/contacts/+14155550101', headers=LAUNCH,
+                                                json={'name': 'Sam', 'notes': 'Local only'})
+                self.assertEqual(response.status, 200)
+                theirs = await (await d.client.get('/v1/contacts', headers=d.as_owner(A))).json()
+                self.assertEqual(theirs, {'contacts': []})
+                response = await d.client.get('/v1/contacts/+14155550101', headers=d.as_owner(A))
+                self.assertEqual(response.status, 404)
+                response = await d.client.patch('/v1/contacts/+14155550101', headers=d.as_owner(A),
+                                                json={'notes': 'Overwritten by A'})
+                self.assertEqual((response.status, (await response.json())['error']['code']), (501, 'unsupported'))
+                response = await d.client.delete('/v1/contacts/+14155550101', headers=d.as_owner(A))
+                self.assertEqual(response.status, 501)
+                mine = await (await d.client.get('/v1/contacts/+14155550101', headers=LAUNCH)).json()
+                self.assertEqual((mine['name'], mine['notes']), ('Sam', 'Local only'))
+                # Nor does the local owner's switch decide what an owner's calls start with.
+                d.hooks.contact_book.update('+14155550101', {'autoContext': True})
+                earlier = await (await d.client.post('/v1/calls', json=brief(to='+14155550101'),
+                                                     headers=d.as_owner(A))).json()
+                d.line.gate(earlier['id']).set()
+                await d.service.wait(earlier['id'], owner=A, timeout=5)
+                checked = await (await d.client.post('/v1/calls/check', json=brief(to='+14155550101'),
+                                                     headers=d.as_owner(A))).json()
+                self.assertEqual(checked['carried'], 0)
+                mine = await (await d.client.post('/v1/calls/check', json=brief(to='+14155550101'),
+                                                  headers=LAUNCH)).json()
+                self.assertEqual(mine['carried'], 0)
+            finally:
+                await d.close()
+
+
 class TwoNumbers(DefaultCallHooks):
     """Each owner has its own phone credentials and number, and a wallet that may refuse."""
     AUTH = {'local': 'tw-secret', A: 'tw-acct-a'}
