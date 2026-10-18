@@ -160,6 +160,8 @@ def build_app(args):
         server_mode=args.server,
     )
     supervisor.bind_daemon(app.runtime_daemon)
+    from meeting_line import meeting_environment
+    supervisor.owner_environment = lambda owner: meeting_environment(app.call_service.hooks, owner)
     attach_phone_gateway(app, app.call_service)
     app.meeting_supervisor = supervisor
     app.auth_token_path = token_path

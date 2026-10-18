@@ -11,6 +11,10 @@ services:
       - path: ${SMITLINE_ROOT:-/data}/.env
       - path: ${SMITLINE_ROOT:-/data}/.env.meeting
         required: false
+      # A hosted deployment's account settings for one meeting (OpenAI key, voice, name),
+      # written by the daemon just before the meeting starts; otherwise .env.meeting again.
+      - path: ${SMITLINE_MEETING_ENV_FILE:-${SMITLINE_ROOT:-/data}/.env.meeting}
+        required: false
     environment:
       HOME: /tmp
       SMITLINE_AUTH_MODE: ${SMITLINE_AUTH_MODE:-}

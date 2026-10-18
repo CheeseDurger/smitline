@@ -2,7 +2,10 @@
 import asyncio
 
 from briefing import EARLIER_CALLS_HEADING
+from call_hooks import owner_settings
 
+# What an owner's settings give its meeting container, over the shared .env.
+MEETING_SETTINGS = ('SMITLINE_VOICE', 'SMITLINE_PARTICIPANT_NAME', 'SMITLINE_OWNER_NAME')
 MEETING_STATUS = {
     'joining': 'connecting',
     'waiting_for_admission': 'waiting',
@@ -35,6 +38,14 @@ def context_from_brief(brief):
         'importantFiles': [],
         'recentConversation': [],
     }
+
+
+def meeting_environment(hooks, owner):
+    """The OpenAI key, voice, and name a meeting for `owner` runs with."""
+    env = {'OPENAI_API_KEY': hooks.credentials(owner, 'openai')['apiKey']}
+    settings = owner_settings(hooks, owner)
+    env.update({key: settings[key] for key in MEETING_SETTINGS if settings.get(key)})
+    return env
 
 
 def meeting_payload(brief):
@@ -80,7 +91,7 @@ class MeetingLine:
         ctx.set_status('connecting')
         self._starting.add(ctx.call_id)
         try:
-            session = await self.daemon.create_meeting(meeting_payload(ctx.brief))
+            session = await self.daemon.create_meeting(meeting_payload(ctx.brief), owner=ctx.owner)
         finally:
             self._starting.discard(ctx.call_id)
         self._meetings[ctx.call_id] = session.id
@@ -95,7 +106,7 @@ class MeetingLine:
         started = None
         limit = ctx.brief.max_minutes * 60
         while True:
-            session = await self.daemon.get_meeting(meeting_id)
+            session = await self.daemon.get_meeting(meeting_id, owner=ctx.owner)
             if session.state != last:
                 last = session.state
                 if session.state == 'live' and started is None:
@@ -110,7 +121,7 @@ class MeetingLine:
                 ctx.event('call.max_duration')
                 await self.daemon.cancel_meeting(meeting_id)
             await self._sleep(self.poll_interval)
-        handoff = await self._await_handoff(meeting_id)
+        handoff = await self._await_handoff(meeting_id, ctx.owner)
         # The result is judged from what was said, so the call gets the meeting's transcript.
         try:
             entries = self._transcript(meeting_id)
@@ -130,11 +141,11 @@ class MeetingLine:
         self._over_time.discard(ctx.call_id)
         await ctx.finish(reason, usage={'voiceSeconds': seconds}, handoff=handoff)
 
-    async def _await_handoff(self, meeting_id):
+    async def _await_handoff(self, meeting_id, owner):
         deadline = self._now() + self.handoff_timeout
         while self._now() < deadline:
             try:
-                handoff = await self.daemon.get_handoff(meeting_id)
+                handoff = await self.daemon.get_handoff(meeting_id, owner=owner)
             except Exception:
                 await self._sleep(self.poll_interval)
                 continue

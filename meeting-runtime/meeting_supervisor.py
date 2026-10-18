@@ -7,7 +7,7 @@ import os
 from meeting_finalizer import MeetingFinalizer, archive_dir, load_finalization
 from runtime_state import (
     active_meeting_path, ensure_private_dir, meeting_state_path, read_json, state_from_session,
-    write_private_json,
+    write_private_file, write_private_json,
 )
 
 try:
@@ -41,6 +41,17 @@ TERMINAL_STAGES = frozenset({
     'api_error', 'closed_without_final_usage',
 })
 COMPLETE_REASONS = frozenset({'finished', 'meeting_ended'})
+
+
+def owner_env_file(values):
+    """KEY='value' lines, which compose reads literally; a value it could not read that way
+    (a quote, a control character) is left out."""
+    lines = []
+    for key, value in values.items():
+        value = str(value or '')
+        if value and "'" not in value and not any(ord(char) < 32 for char in value):
+            lines.append(f"{key}='{value}'")
+    return ''.join(line + '\n' for line in lines)
 
 
 class CommandResult:
@@ -193,6 +204,7 @@ class ProductionMeetingSupervisor:
         poll_interval=1.0,
         start_timeout=30.0,
         stop_timeout=25.0,
+        owner_environment=None,
     ):
         self.project_root = Path(project_root).resolve()
         self.runtime_root = Path(runtime_root or (self.project_root / 'meeting-runtime')).resolve()
@@ -202,6 +214,9 @@ class ProductionMeetingSupervisor:
         self.poll_interval = poll_interval
         self.start_timeout = start_timeout
         self.stop_timeout = stop_timeout
+        # owner_environment(owner): what a meeting for that owner gets over the shared .env
+        # (its OpenAI key, voice, and name). The local owner's meetings read .env as always.
+        self.owner_environment = owner_environment
         self.daemon = None
         self._lock = asyncio.Lock()
         self._active_id = None
@@ -213,13 +228,28 @@ class ProductionMeetingSupervisor:
         self.daemon = daemon
         return self
 
-    def _container_env(self, session):
+    def _container_env(self, session, owner_env=None):
         state_path = meeting_state_path(self.runtime_root, session.id)
-        return {
+        env = {
             'SMITLINE_RUNTIME_STATE': '/meeting-runtime/run/meetings/' + session.id + '/runtime.json',
             'MEETING_URL': session.meeting_url,
             'SMITLINE_HOST_RUNTIME_STATE': str(state_path),
         }
+        if owner_env is not None:
+            # The compose file reads it after .env and .env.meeting, so its values win.
+            env['SMITLINE_MEETING_ENV_FILE'] = str(owner_env)
+        return env
+
+    def _write_owner_env(self, session):
+        """The private env file for a meeting of an owner other than the local one, or None."""
+        if self.owner_environment is None or getattr(session, 'owner', 'local') == 'local':
+            return None
+        body = owner_env_file(self.owner_environment(session.owner) or {})
+        if not body:
+            return None
+        path = meeting_state_path(self.runtime_root, session.id).with_name('owner.env')
+        write_private_file(path, body)
+        return path
 
     def _prepare_mounts(self):
         for name in MOUNTED_DIRS:
@@ -258,7 +288,13 @@ class ProductionMeetingSupervisor:
             self._write_session_files(session, camera_settings=camera_settings)
             try:
                 self._prepare_mounts()
-                await self.launcher.up(self._container_env(session))
+                owner_env = self._write_owner_env(session)
+                try:
+                    await self.launcher.up(self._container_env(session, owner_env))
+                finally:
+                    # Compose copied it into the container; no key stays on disk.
+                    if owner_env is not None:
+                        owner_env.unlink(missing_ok=True)
                 await self._wait_until_running()
                 await self._wait_until_health()
             except Exception:

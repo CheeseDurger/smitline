@@ -116,12 +116,12 @@ class CallServiceTests(unittest.IsolatedAsyncioTestCase):
         record = await self.h.service.create(brief(notify={'webhookUrl': 'https://example.com/h'}))
         self.assertEqual(record['status'], 'queued')
         await asyncio.sleep(0)
-        waiting = await self.h.service.wait(record['id'], timeout=0.05)
+        waiting = await self.h.service.wait(record['id'], timeout=0.05, owner='local')
         self.assertEqual(waiting['status'], 'in_progress')
         self.assertIsNotNone(waiting['answeredAt'])
         self.assertEqual(waiting['line'], {'providerCallSid': 'CA123'})
         self.h.line.proceed.set()
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['status'], 'completed')
         self.assertEqual(done['endReason'], 'hangup')
         self.assertEqual(done['result']['outcome'], 'achieved')
@@ -141,27 +141,27 @@ class CallServiceTests(unittest.IsolatedAsyncioTestCase):
         self.h.line.end_reason = 'no_answer'
         self.h.line.proceed.set()
         record = await self.h.service.create(brief())
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['result']['outcome'], 'not_reached')
         self.assertEqual(self.h.summarizer.calls, 0)
 
     async def test_line_failure_marks_failed(self):
         self.h.line.fail = RuntimeError('dial failed')
         record = await self.h.service.create(brief())
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['status'], 'failed')
         self.assertIn('dial failed', done['error'])
 
     async def test_instruct_and_end(self):
         record = await self.h.service.create(brief())
         await asyncio.sleep(0)
-        self.assertEqual(await self.h.service.instruct(record['id'], 'Ask about parking.'),
+        self.assertEqual(await self.h.service.instruct(record['id'], 'Ask about parking.', owner='local'),
                          {'delivered': True})
-        await self.h.service.end(record['id'])
-        done = await self.h.service.wait(record['id'], timeout=5)
+        await self.h.service.end(record['id'], owner='local')
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['status'], 'completed')
         with self.assertRaises(CallError):
-            await self.h.service.instruct(record['id'], 'too late')
+            await self.h.service.instruct(record['id'], 'too late', owner='local')
 
     async def test_refusals(self):
         with self.assertRaises(CallError) as caught:
@@ -200,7 +200,7 @@ class CallServiceTests(unittest.IsolatedAsyncioTestCase):
         self.h.summarizer.summarize = asked_not_to_call
         record = await self.h.service.create(brief())
         self.h.line.proceed.set()
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertTrue(done['result']['doNotCall'])
         self.assertIn('call.do_not_call', [e['type'] for e in self.h.service.events(record['id'])])
         listed = self.h.service.do_not_call('local')['numbers']
@@ -215,7 +215,7 @@ class CallServiceTests(unittest.IsolatedAsyncioTestCase):
         self.h.line.proceed = asyncio.Event()
         rehearsal = await self.h.service.create(brief(rehearsal=True))
         self.h.line.proceed.set()
-        await self.h.service.wait(rehearsal['id'], timeout=5)
+        await self.h.service.wait(rehearsal['id'], timeout=5, owner='local')
         self.assertEqual(self.h.service.do_not_call('local')['numbers'], [])
         with self.assertRaises(CallError) as caught:
             self.h.service.update_do_not_call('local', {'add': ['555']})
@@ -224,14 +224,14 @@ class CallServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_statuses_never_move_backwards(self):
         record = await self.h.service.create(brief())
         await asyncio.sleep(0)
-        await self.h.service.wait(record['id'], timeout=0.05)
+        await self.h.service.wait(record['id'], timeout=0.05, owner='local')
         self.h.service._set_status(record['id'], 'ringing')
         self.assertEqual(self.h.store.get(record['id'])['status'], 'in_progress')
 
     async def test_shutdown_and_restart_close_unfinished_calls(self):
         record = await self.h.service.create(brief())
         await asyncio.sleep(0)
-        await self.h.service.wait(record['id'], timeout=0.05)
+        await self.h.service.wait(record['id'], timeout=0.05, owner='local')
         self.h.line.proceed = asyncio.Event()  # never finishes on its own
         await self.h.service.shutdown()
         done = self.h.store.get(record['id'])
@@ -267,15 +267,15 @@ class FakeDaemon:
         self.canceled = []
         self.handoff_tries = 0
 
-    async def create_meeting(self, payload):
+    async def create_meeting(self, payload, owner='local'):
         self.created.append(payload)
         return FakeSession(id='mtg-1', platform='zoom', state='joining')
 
-    async def get_meeting(self, meeting_id):
+    async def get_meeting(self, meeting_id, owner=None):
         state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
         return FakeSession(id=meeting_id, state=state)
 
-    async def get_handoff(self, meeting_id):
+    async def get_handoff(self, meeting_id, owner=None):
         self.handoff_tries += 1
         if self.handoff_tries < 2:
             raise RuntimeError('not ready')
@@ -299,7 +299,7 @@ class MeetingLineTests(unittest.IsolatedAsyncioTestCase):
             h = ServiceHarness(temp, lines={'meeting': line})
             record = await h.service.create(brief(channel='meeting', to=ZOOM,
                                                   context='Q3 sales review'))
-            done = await h.service.wait(record['id'], timeout=5)
+            done = await h.service.wait(record['id'], timeout=5, owner='local')
             self.assertEqual(done['status'], 'completed')
             self.assertEqual(done['line']['meetingId'], 'mtg-1')
             self.assertEqual(done['result']['source'], 'meeting_handoff')
@@ -327,7 +327,7 @@ class MeetingLineTests(unittest.IsolatedAsyncioTestCase):
                                transcript=lambda meeting_id: spoken if meeting_id == 'mtg-1' else [])
             h = ServiceHarness(temp, lines={'meeting': line})
             record = await h.service.create(brief(channel='meeting', to=ZOOM))
-            done = await h.service.wait(record['id'], timeout=5)
+            done = await h.service.wait(record['id'], timeout=5, owner='local')
             self.assertEqual(h.summarizer.calls, 1)
             self.assertEqual(done['result']['source'], 'summary_model')
             self.assertEqual(done['result']['transcript'], spoken)
@@ -350,7 +350,7 @@ class MeetingLineTests(unittest.IsolatedAsyncioTestCase):
                 raise SummaryUnavailable('summary request failed (429)')
             h.summarizer.summarize = unavailable
             record = await h.service.create(brief(channel='meeting', to=ZOOM))
-            done = await h.service.wait(record['id'], timeout=5)
+            done = await h.service.wait(record['id'], timeout=5, owner='local')
             self.assertEqual(done['result']['outcome'], 'failed')
             self.assertIn('no summary was produced', done['result']['summary'])
             self.assertEqual(done['result']['transcript'], [{'speaker': 'meeting', 'text': 'Hello?'}])
@@ -363,9 +363,9 @@ class MeetingLineTests(unittest.IsolatedAsyncioTestCase):
             gate = asyncio.Event()
             original = daemon.create_meeting
 
-            async def slow_create(payload):
+            async def slow_create(payload, owner='local'):
                 await gate.wait()
-                return await original(payload)
+                return await original(payload, owner=owner)
             daemon.create_meeting = slow_create
 
             async def no_sleep(_seconds):
@@ -374,10 +374,10 @@ class MeetingLineTests(unittest.IsolatedAsyncioTestCase):
             h = ServiceHarness(temp, lines={'meeting': line})
             record = await h.service.create(brief(channel='meeting', to=ZOOM))
             await asyncio.sleep(0)
-            await h.service.end(record['id'])
+            await h.service.end(record['id'], owner='local')
             self.assertEqual(h.store.get(record['id'])['status'], 'connecting')
             gate.set()
-            done = await h.service.wait(record['id'], timeout=5)
+            done = await h.service.wait(record['id'], timeout=5, owner='local')
             self.assertEqual(daemon.canceled, ['mtg-1'])
             self.assertEqual(done['endReason'], 'canceled')
             await h.service.shutdown()
@@ -393,7 +393,7 @@ class MeetingLineTests(unittest.IsolatedAsyncioTestCase):
             line = MeetingLine(daemon, sleep=no_sleep, monotonic=lambda: next(ticks))
             h = ServiceHarness(temp, lines={'meeting': line})
             record = await h.service.create(brief(channel='meeting', to=ZOOM, maxMinutes=1))
-            done = await h.service.wait(record['id'], timeout=5)
+            done = await h.service.wait(record['id'], timeout=5, owner='local')
             self.assertEqual(daemon.canceled, ['mtg-1'])
             self.assertEqual(done['endReason'], 'max_duration')
             await h.service.shutdown()
@@ -527,7 +527,7 @@ class MeetingThroughRealDaemonTests(unittest.IsolatedAsyncioTestCase):
             record = await harness.service.create(brief(
                 channel='meeting', to=ZOOM, context='Q3 sales review',
                 mustNotShare=['salaries'], mayAgreeTo=['moving the deadline a week']))
-            call = await harness.service.wait(record['id'], timeout=0.2)
+            call = await harness.service.wait(record['id'], timeout=0.2, owner='local')
             meeting_id = call['line']['meetingId']
             self.assertEqual(supervisor.started, [meeting_id])
             session = await daemon.get_meeting(meeting_id)
@@ -541,7 +541,7 @@ class MeetingThroughRealDaemonTests(unittest.IsolatedAsyncioTestCase):
             daemon.transition(meeting_id, 'ended')
             daemon.store_handoff(handoff_payload(meetingId=meeting_id, startedAt=session.started_at,
                                                  summary='Agreed on Q3.'))
-            done = await harness.service.wait(record['id'], timeout=5)
+            done = await harness.service.wait(record['id'], timeout=5, owner='local')
             self.assertEqual(done['status'], 'completed')
             self.assertEqual(done['result']['summary'], 'Agreed on Q3.')
             self.assertEqual(done['result']['actionItems'], ['dev: Send the meeting notes'])
@@ -567,7 +567,7 @@ class MeetingThroughRealDaemonTests(unittest.IsolatedAsyncioTestCase):
                              call_service_factory=lines)
             daemon = app.runtime_daemon
             record = await harness.service.create(brief(channel='meeting', to=ZOOM))
-            call = await harness.service.wait(record['id'], timeout=0.2)
+            call = await harness.service.wait(record['id'], timeout=0.2, owner='local')
             meeting_id = call['line']['meetingId']
             daemon.transition(meeting_id, 'live')
 
@@ -594,7 +594,7 @@ class MeetingThroughRealDaemonTests(unittest.IsolatedAsyncioTestCase):
             text = (archive_dir(runtime_root, meeting_id) / 'transcript.txt').read_text()
             self.assertIn('Can we move the launch to Friday?', text)
             self.assertIn('Robin agreed to Friday earlier today.', text)
-            done = await harness.service.wait(record['id'], timeout=5)
+            done = await harness.service.wait(record['id'], timeout=5, owner='local')
             self.assertEqual(done['status'], 'completed')
             self.assertIn('2 transcript entries', done['result']['summary'])
             await harness.service.shutdown()

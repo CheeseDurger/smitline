@@ -483,7 +483,7 @@ class PhoneSession:
                                             has_notes=bool(notes),
                                             boundaries=(profile or {}).get('boundaries') or ()),
             audio_format=PCMU8,
-            voice=self.brief.voice or default_voice(env),
+            voice=self.brief.voice or default_voice(owner_settings(self.ctx, env)),
             delegation=delegation_config(
                 self.brief, model=self.backend_model,
                 web_search=env.get('SMITLINE_PHONE_WEB_SEARCH') == '1', inbound=self.inbound,
@@ -1209,9 +1209,11 @@ class PhoneLine:
                               'SMITLINE_PUBLIC_URL, or install cloudflared or Docker for a '
                               'quick tunnel.')
 
-    def _recording(self, brief):
-        """Record this call: the brief asked for it, or SMITLINE_RECORD_CALLS=1 records every call."""
-        return bool(brief.record) or self.environ().get('SMITLINE_RECORD_CALLS') == '1'
+    def _recording(self, ctx):
+        """Record this call: the brief asked for it, or the owner's SMITLINE_RECORD_CALLS=1
+        records every call."""
+        settings = owner_settings(ctx, self.environ())
+        return bool(ctx.brief.record) or settings.get('SMITLINE_RECORD_CALLS') == '1'
 
     async def recording_audio(self, credentials, record, fmt):
         """The call's recording from the provider, as (bytes, content type).
@@ -1255,12 +1257,13 @@ class PhoneLine:
     def _sip_session(self, ctx, *, bridged=False):
         openai = ctx.credentials('openai')
         phone = ctx.credentials('twilio')
-        env = self.environ()
+        # The number shown and the phone a transfer rings are the owner's own.
         return SipPhoneSession(
             self, ctx, api_key=openai['apiKey'], client=self.sip_client_factory(openai['apiKey']),
             twilio=self.twilio_factory(phone) if bridged else None,
-            from_number=env.get('SMITLINE_CALLER_ID') or phone['fromNumber'],
-            owner_phone=env.get('SMITLINE_OWNER_PHONE'), bridged=bridged)
+            from_number=phone['fromNumber'],
+            owner_phone=owner_settings(ctx, self.environ()).get('SMITLINE_OWNER_PHONE'),
+            bridged=bridged)
 
     async def _start_sip(self, ctx):
         """OpenAI dials out through the provider's SIP trunk; audio never touches this computer."""
@@ -1346,13 +1349,12 @@ class PhoneLine:
     async def _start_relay(self, ctx):
         openai = ctx.credentials('openai')
         twilio_creds = ctx.credentials('twilio')
-        env = self.environ()
         twilio = self.twilio_factory(twilio_creds)
         session = PhoneSession(
             self, ctx, api_key=openai['apiKey'], twilio=twilio,
-            from_number=env.get('SMITLINE_CALLER_ID') or twilio_creds['fromNumber'],
-            token=secrets.token_urlsafe(24), recording=self._recording(ctx.brief),
-            owner_phone=env.get('SMITLINE_OWNER_PHONE'))
+            from_number=twilio_creds['fromNumber'],
+            token=secrets.token_urlsafe(24), recording=self._recording(ctx),
+            owner_phone=owner_settings(ctx, self.environ()).get('SMITLINE_OWNER_PHONE'))
         self.sessions[ctx.call_id] = session
         try:
             ctx.set_status('connecting')
@@ -1464,13 +1466,13 @@ class PhoneLine:
     async def start_inbound(self, ctx, *, call_sid, token):
         openai = ctx.credentials('openai')
         twilio_creds = ctx.credentials('twilio')
-        env = self.environ()
         session = PhoneSession(
             self, ctx, api_key=openai['apiKey'], twilio=self.twilio_factory(twilio_creds),
             from_number=twilio_creds.get('twilioNumber') or twilio_creds['fromNumber'],
             token=token, inbound=True,
             # Incoming calls are not recorded, so the greeting must not say they are.
-            recording=False, owner_phone=env.get('SMITLINE_OWNER_PHONE'))
+            recording=False,
+            owner_phone=owner_settings(ctx, self.environ()).get('SMITLINE_OWNER_PHONE'))
         session.call_sid = call_sid
         self.sessions[ctx.call_id] = session
         try:
@@ -1573,8 +1575,15 @@ class PhoneLine:
         return await session.transfer()
 
 
+def owner_settings(ctx, fallback):
+    """The call owner's settings; `fallback` (the installation's) for contexts without them."""
+    settings = getattr(ctx, 'settings', None)
+    return settings() if callable(settings) else fallback
+
+
 def inbound_brief(environ, caller):
-    """The brief for a call someone placed to us. Withheld numbers are still answered."""
+    """The brief for a call someone placed to us, from the called owner's settings.
+    Withheld numbers are still answered."""
     context = None
     try:
         to = normalize_phone(caller or '')

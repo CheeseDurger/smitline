@@ -8,6 +8,7 @@ import {
   ValidationError,
   StartupError,
   createLoopbackTransport,
+  createRemoteTransport,
   isManaged,
   MANAGED_NOT_RUNNING,
 } from '../src/index.mjs';
@@ -94,6 +95,39 @@ test('stale token is rotated from host-only auth file without exposing it', asyn
     assert.ok(!dumped.includes('brand-new-token'));
     assert.ok(!dumped.includes('test-daemon-token'));
   });
+});
+
+test('a remote daemon gets the fixed token and extra headers, and is never started', async (t) => {
+  const daemon = await startFakeDaemon({ token: 'cai_remote' });
+  t.after(() => daemon.close());
+  const colleague = new Smitline({
+    baseUrl: `http://127.0.0.1:${daemon.port}/`,
+    token: 'cai_remote',
+    headers: { 'X-Smitline-Owner': 'acct_3f9c2a7b1d', Authorization: 'Bearer ignored' },
+    autostart: false,
+    root: '/nonexistent',
+  });
+  const call = await colleague.startCall({ channel: 'phone', to: '+14155550142', objective: 'x' });
+  assert.equal((await colleague.getCall(call.id)).id, call.id);
+  for (const request of daemon.state.requests) {
+    assert.equal(request.headers.authorization, 'Bearer cai_remote');
+    assert.equal(request.headers['x-smitline-owner'], 'acct_3f9c2a7b1d');
+  }
+  // A wrong token is an error at once: no daemon.auth to reread, no retry.
+  daemon.rotateToken('other');
+  const before = daemon.state.requests.length;
+  await assert.rejects(colleague.getCall(call.id), (error) => error.status === 401);
+  assert.equal(daemon.state.requests.length, before + 1);
+});
+
+test('a remote daemon needs a URL and a token', () => {
+  assert.throws(() => createRemoteTransport({ baseUrl: 'http://127.0.0.1:1' }), ValidationError);
+  assert.throws(() => new Smitline({ baseUrl: 'ftp://example.com', token: 't' }), ValidationError);
+  let spawned = false;
+  const transport = createRemoteTransport({ baseUrl: 'https://smitline.example.com', token: 't',
+    spawnDaemon: () => { spawned = true; } });
+  assert.equal(transport.origin, 'https://smitline.example.com');
+  assert.equal(spawned, false);
 });
 
 test('startup errors are StartupError', async (t) => {

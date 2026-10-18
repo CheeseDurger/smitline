@@ -278,7 +278,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(live.outputs, [])
         await asyncio.wait_for(task, 3)
         self.h.line.on_status(record['id'], {'CallStatus': 'completed', 'CallDuration': '40'})
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['status'], 'completed')
         self.assertEqual(done['endReason'], 'hangup')
         self.assertEqual(done['usage']['voiceSeconds'], 33)
@@ -304,7 +304,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
     async def test_unanswered_call_needs_no_summary(self):
         record, _session = await self.h.dial()
         self.h.line.on_status(record['id'], {'CallStatus': 'no-answer', 'CallDuration': '0'})
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual((done['endReason'], done['result']['outcome']), ('no_answer', 'not_reached'))
         self.assertEqual(FakeSummarizer.calls, 0)
 
@@ -371,7 +371,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
                 'arguments': '{"reason": "completed"}'}}})
         await until(lambda: ws.closed)
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertFalse(any(kind == 'session.instructions.append' for kind, _ in live.appends))
         self.assertIs(done['result']['disclosureVerified'], True)
 
@@ -398,7 +398,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
                    'end_ms': 6500})
         await until(lambda: ws.closed)
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['endReason'], 'hangup')
         self.assertIs(done['result']['disclosureVerified'], True)
 
@@ -418,7 +418,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
                     'arguments': '{"reason": "completed"}'}}})
             await until(lambda: ws.closed)
             await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         disclosure = [e['data'] for e in self.h.service.events(record['id']) if e['type'] == 'call.disclosure']
         self.assertEqual(disclosure, [{'verified': False}])
         self.assertIs(done['result']['disclosureVerified'], False)
@@ -435,7 +435,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.2)
         ws.push({'event': 'stop'})
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['endReason'], 'remote_hangup')
         self.assertIs(done['result']['disclosureVerified'], False)
 
@@ -469,7 +469,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('- Never discuss money.', backend)
         # A note from the agent mid-call is silent context, not an instruction.
         live.push({'type': 'session.started', 'session': {}})
-        self.assertEqual(await self.h.service.instruct(record['id'], 'He tried it yesterday.', silent=True),
+        self.assertEqual(await self.h.service.instruct(record['id'], 'He tried it yesterday.', silent=True, owner='local'),
                          {'delivered': True})
         self.assertIn(('session.thinking.append', 'He tried it yesterday.'), live.appends)
         ws.push({'event': 'stop'})
@@ -519,7 +519,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
                 'arguments': '{"reason": "completed"}'}}})
         await until(lambda: ws.closed)
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['endReason'], 'hangup')
 
     async def test_leaving_a_voicemail_is_reported_as_voicemail(self):
@@ -532,7 +532,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
                 'arguments': '{"reason": "voicemail_left"}'}}})
         await until(lambda: ws.closed)
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['endReason'], 'voicemail')
 
     async def test_hangup_gives_way_when_they_keep_talking(self):
@@ -563,7 +563,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
                 'arguments': '{"reason": "completed"}'}}})
         await until(lambda: ws.closed)
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['endReason'], 'hangup')
         self.assertEqual(done['usage']['audio']['hangupsYielded'], 1)
 
@@ -585,7 +585,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(session.pacer.unplayed_seconds(), 0.1)
         ws.push({'event': 'stop'})
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         audio = done['usage']['audio']
         self.assertEqual(audio['interruptionsFollowed'], 1)
         self.assertGreaterEqual(audio['maxUnplayedMs'], 1900)
@@ -633,7 +633,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         await until(lambda: session.pacer.unplayed_seconds() > 0)
         ws.push({'event': 'stop'})
         await asyncio.wait_for(task, 3)
-        audio = (await self.h.service.wait(record['id'], timeout=5))['usage']['audio']
+        audio = (await self.h.service.wait(record['id'], timeout=5, owner='local'))['usage']['audio']
         self.assertEqual((audio['pauses'], audio['backchannels'], audio['interruptionsFollowed']), (2, 1, 1))
         self.assertEqual(audio['stopDelayMs'], {'median': 160, 'max': 160, 'count': 2})
         self.assertEqual(audio['replyDelayMs']['count'], 1)
@@ -697,24 +697,24 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         self.h.line.on_amd(record['id'], 'machine_end_beep')
         await until(lambda: any('voicemail' in text for _kind, text in live.appends))
         with self.assertRaises(CallError) as caught:
-            await self.h.service.transfer(record['id'])
+            await self.h.service.transfer(record['id'], owner='local')
         self.assertEqual(caught.exception.code, 'not_ready')
         self.h.env['SMITLINE_OWNER_PHONE'] = '+14155550199'
         session.owner_phone = '+14155550199'
-        result = await self.h.service.transfer(record['id'])
+        result = await self.h.service.transfer(record['id'], owner='local')
         self.assertEqual(result, {'transferred': True})
         twiml = self.h.twilio.updates[-1][1]['twiml']
         self.assertIn('+14155550199', twiml)
         self.assertIn('callerId="+15005550006"', twiml)
         ws.push({'event': 'stop'})
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['endReason'], 'transferred')
 
     async def test_end_while_ringing_cancels(self):
         record, _session = await self.h.dial()
-        await self.h.service.end(record['id'])
-        done = await self.h.service.wait(record['id'], timeout=5)
+        await self.h.service.end(record['id'], owner='local')
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['status'], 'canceled')
         self.assertEqual(self.h.twilio.updates[0], ('CA123', {'status': 'canceled'}))
 
@@ -735,9 +735,9 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         self.h.url_ready.clear()
         record = await self.h.service.create(brief())
         await until(lambda: self.h.line.session(record['id']) is not None)
-        await self.h.service.end(record['id'])
+        await self.h.service.end(record['id'], owner='local')
         self.h.url_ready.set()
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['status'], 'canceled')
         self.assertEqual(self.h.twilio.created, [])
 
@@ -745,14 +745,14 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         self.h.line.connect_timeout = 0.1
         self.h.twilio.remote_status = 'in-progress'
         record, _session = await self.h.dial()
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['status'], 'failed')
         self.assertIn('could not reach the phone gateway', done['error'])
         self.assertIn(('CA123', {'status': 'completed'}), self.h.twilio.updates)
         # Twilio says nobody answered and the callback was lost: an ordinary no-answer.
         self.h.twilio.remote_status = 'no-answer'
         record, _session = await self.h.dial()
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual((done['status'], done['endReason']), ('completed', 'no_answer'))
 
     async def test_voice_session_failures_are_errors(self):
@@ -763,7 +763,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         record, session = await self.h.dial()
         ws = FakeTwilioSocket()
         await session.run(ws, {'streamSid': 'MZ1', 'callSid': 'CA123'})
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['status'], 'failed')
         self.assertIn('voice session could not start', done['error'])
         self.assertTrue(ws.closed)
@@ -775,7 +775,7 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         live.push({'type': 'session.input_transcript.delta', 'delta': 'Hello?', 'start_ms': 0, 'end_ms': 300})
         live.push({'type': 'drop'})
         await asyncio.wait_for(task, 3)
-        done = await self.h.service.wait(record['id'], timeout=5)
+        done = await self.h.service.wait(record['id'], timeout=5, owner='local')
         self.assertEqual(done['endReason'], 'error')
         self.assertIn('voice connection was lost', done['error'])
 
@@ -785,17 +785,17 @@ class PhoneLineTests(unittest.IsolatedAsyncioTestCase):
         session.owner_phone = '+14155550199'
         ws, live, task = await self.h.connect(record, session)
         live.push({'type': 'session.started', 'session': {}})
-        await self.h.service.end(record['id'])
+        await self.h.service.end(record['id'], owner='local')
         pending = session._pending_hangup
         self.assertIsNotNone(pending)
         self.h.twilio.refuse_twiml = True
         with self.assertRaises(CallError) as caught:
-            await self.h.service.transfer(record['id'])
+            await self.h.service.transfer(record['id'], owner='local')
         self.assertEqual((caught.exception.status, caught.exception.code), (502, 'provider_error'))
         self.assertIsNone(session.end_reason)
         self.assertTrue(pending.cancelled() or pending.done())
         self.h.twilio.refuse_twiml = False
-        await self.h.service.transfer(record['id'])
+        await self.h.service.transfer(record['id'], owner='local')
         self.assertEqual(session.end_reason, 'transferred')
         ws.push({'event': 'stop'})
         await asyncio.wait_for(task, 3)
@@ -1396,7 +1396,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post_signed('/twilio/inbound', params)
         twiml = await response.text()
         self.assertIn('<Connect><Stream url="wss://abc-123.trycloudflare.com/twilio/media">', twiml)
-        calls = self.h.service.list()
+        calls = self.h.service.list(owner='local')
         self.assertEqual(calls[0]['direction'], 'inbound')
         self.assertIn(calls[0]['id'], twiml)
 
@@ -1425,7 +1425,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         other, _ = await self.h.dial(to='+14155550199')
         self.assertFalse(self.h.twilio.created[-1]['record'])
         with self.assertRaises(CallError) as caught:
-            await self.h.service.recording(record['id'])
+            await self.h.service.recording(record['id'], owner='local')
         self.assertEqual(caught.exception.code, 'not_ready')
         await self.post_signed(f'/twilio/recording/{record["id"]}', {
             'RecordingSid': 'RE1', 'RecordingStatus': 'completed', 'RecordingDuration': '42',
@@ -1436,18 +1436,18 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             fetched.append(url)
             return b'RIFF....WAVE', 'audio/x-wav'
         self.h.twilio.download = download
-        body, content_type = await self.h.service.recording(record['id'])
+        body, content_type = await self.h.service.recording(record['id'], owner='local')
         self.assertEqual((body, content_type), (b'RIFF....WAVE', 'audio/x-wav'))
-        await self.h.service.recording(record['id'], fmt='mp3')
+        await self.h.service.recording(record['id'], fmt='mp3', owner='local')
         self.assertEqual(fetched, ['https://api.twilio.com/2010-04-01/Accounts/AC1/Recordings/RE1.wav',
                                    'https://api.twilio.com/2010-04-01/Accounts/AC1/Recordings/RE1.mp3'])
         with self.assertRaises(CallError) as caught:
-            await self.h.service.recording(record['id'], fmt='flac')
+            await self.h.service.recording(record['id'], fmt='flac', owner='local')
         self.assertEqual(caught.exception.status, 422)
         # Credentials never go to a host other than the provider's API.
         self.h.store.update(record['id'], recording={'sid': 'RE1', 'url': 'https://evil.example/Recordings/RE1.mp3'})
         with self.assertRaises(CallError) as caught:
-            await self.h.service.recording(record['id'])
+            await self.h.service.recording(record['id'], owner='local')
         self.assertEqual(caught.exception.code, 'not_ready')
         self.assertEqual(len(fetched), 2)
         # Direct SIP calls cannot be recorded yet, so asking is refused before dialing.
@@ -1464,7 +1464,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('<Connect>', await response.text())
         response = await self.post_signed('/twilio/inbound', {**first, 'CallSid': 'CA2'})
         self.assertIn('<Reject reason="busy"/>', await response.text())
-        self.assertEqual(len(self.h.service.list()), 1)
+        self.assertEqual(len(self.h.service.list(owner='local')), 1)
 
 
 class SignalWireTests(unittest.IsolatedAsyncioTestCase):
@@ -1614,12 +1614,12 @@ class SipPhoneTests(unittest.IsolatedAsyncioTestCase):
         side.push({'type': 'session.output_audio.delta', 'delta': 'AAAA', 'start_ms': 600, 'end_ms': 620})
         side.push({'type': 'session.input_audio.append', 'audio': 'AAAA'})
         # An instruction from the agent reaches the call through the sideband.
-        self.assertEqual(await self.h.service.instruct(record['id'], 'Mention the patio.'), {'delivered': True})
+        self.assertEqual(await self.h.service.instruct(record['id'], 'Mention the patio.', owner='local'), {'delivered': True})
         side.push({'type': 'response.event', 'delegation_id': 'd1', 'event': {
             'type': 'response.output_item.done', 'item': {
                 'type': 'function_call', 'call_id': 'fc1', 'name': 'end_call',
                 'arguments': '{"reason": "completed"}'}}})
-        done = await self.h.service.wait(record['id'], timeout=8)
+        done = await self.h.service.wait(record['id'], timeout=8, owner='local')
         self.assertEqual(done['status'], 'completed')
         self.assertEqual(done['endReason'], 'hangup')
         self.assertIn(('hangup', 'live_sip_1'), self.client.calls)
@@ -1635,7 +1635,7 @@ class SipPhoneTests(unittest.IsolatedAsyncioTestCase):
         side.push({'type': 'transport.answered', 'event_id': 'e2'})
         side.push({'type': 'session.input_transcript.delta', 'delta': 'No thanks.', 'start_ms': 0, 'end_ms': 400})
         side.push({'type': 'session.closed', 'reason': 'remote_hangup', 'usage': {'seconds': 9}})
-        done = await self.h.service.wait(record['id'], timeout=8)
+        done = await self.h.service.wait(record['id'], timeout=8, owner='local')
         self.assertEqual(done['endReason'], 'remote_hangup')
 
     async def test_a_call_nobody_answers(self):
@@ -1643,7 +1643,7 @@ class SipPhoneTests(unittest.IsolatedAsyncioTestCase):
         side = await self.sideband()
         side.push({'type': 'transport.failed', 'event_id': 'e3',
                    'error': {'type': 'call_error', 'code': 'provider_invite_failed', 'message': 'No answer'}})
-        done = await self.h.service.wait(record['id'], timeout=8)
+        done = await self.h.service.wait(record['id'], timeout=8, owner='local')
         self.assertEqual((done['endReason'], done['result']['outcome']), ('no_answer', 'not_reached'))
         self.assertIn(('hangup', 'live_sip_1'), self.client.calls)
 
@@ -1654,7 +1654,7 @@ class SipPhoneTests(unittest.IsolatedAsyncioTestCase):
         events = [e['type'] for e in self.h.service.events(record['id'])]
         self.assertIn('call.sip_unavailable', events)
         self.assertIn('<Connect><Stream', self.h.twilio.created[0]['twiml'])
-        await self.h.service.end(record['id'])
+        await self.h.service.end(record['id'], owner='local')
 
     async def test_missing_trunk_settings_are_named(self):
         self.h.env.pop('SMITLINE_SIP_PASSWORD')
@@ -1667,11 +1667,11 @@ class SipPhoneTests(unittest.IsolatedAsyncioTestCase):
         side = await self.sideband()
         side.push({'type': 'transport.answered', 'event_id': 'e2'})
         await until(lambda: self.h.store.get(record['id'])['status'] == 'in_progress')
-        result = await self.h.service.transfer(record['id'])
+        result = await self.h.service.transfer(record['id'], owner='local')
         self.assertEqual(result, {'transferred': True})
         self.assertIn(('refer', 'live_sip_1', 'tel:+14155550199'), self.client.calls)
         side.push({'type': 'session.closed', 'reason': 'close_requested', 'usage': {'seconds': 30}})
-        done = await self.h.service.wait(record['id'], timeout=8)
+        done = await self.h.service.wait(record['id'], timeout=8, owner='local')
         self.assertEqual(done['endReason'], 'transferred')
 
 
@@ -1732,7 +1732,7 @@ class SipWebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.gateway.post('/openai/webhook', data=body, headers=headers)).status, 200)
         self.assertEqual(sum(call[0] == 'accept' for call in self.client.calls), 1)
         side.push({'type': 'session.closed', 'reason': 'remote_hangup', 'usage': {'seconds': 12}})
-        done = await self.h.service.wait(record['id'], timeout=8)
+        done = await self.h.service.wait(record['id'], timeout=8, owner='local')
         self.assertEqual(done['endReason'], 'remote_hangup')
 
     async def test_calls_this_installation_did_not_place_are_turned_away(self):
@@ -1831,7 +1831,7 @@ class RealSocketTests(unittest.IsolatedAsyncioTestCase):
         await twilio.send_str(json.dumps({'event': 'stop', 'streamSid': 'MZ9'}))
         await twilio.close()
         self.h.line.on_status(record['id'], {'CallStatus': 'completed', 'CallDuration': '12'})
-        done = await self.h.service.wait(record['id'], timeout=10)
+        done = await self.h.service.wait(record['id'], timeout=10, owner='local')
 
         self.assertEqual(self.record['auth'], 'Bearer sk-test')
         self.assertEqual(self.record['config']['audio']['format'], {'type': 'audio/pcmu', 'rate': 8000})

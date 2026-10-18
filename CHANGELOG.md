@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Owners, so one deployment can serve many accounts.** Every call, meeting, profile, contact book and do-not-call list belongs to an owner, and another owner's are answered as not found. A self-hosted installation has one owner, `local`, with its files where they always were. API tokens can be created for an owner (`api_tokens.py create --owner OWNER`), or as `--kind internal` for a hosted gateway that names the owner of each request with `X-Smitline-Owner`; any other credential sending the header gets `403 owner_header_forbidden`. `SMITLINE_REQUIRE_OWNER=1` refuses requests that would act as `local` (`401 owner_required`), closes the raw `/v1/meetings` API, and turns away incoming calls to numbers no owner has. See [docs/calls.md#owners](docs/calls.md#owners).
+- New optional call hooks: `settings(owner)` (the owner's name, phone, caller ID, voice, guardrails and recording setting), `storage_root(owner)` (other owners' files go in `.smitline/owners/<owner>/`), `contact_book(owner)`, `call_started(owner, record)` (runs before the line starts; a refusal ends the call cleanly), `webhook_secret(owner)` (each other owner signs its webhooks with its own secret) and `owner_for_number(number)` (who an incoming call is for). Repeat limits count only the owner's own calls.
+- A hook's refusal can choose its HTTP status and add details: `CallRefused(code, message, status=403, **details)`, so a hosted service can answer `402 insufficient_credit` with `balance` and `topUpUrl`, or `429 too_many_active_calls`.
+- Phone callbacks are checked with the credentials of the call's owner, and incoming calls with those of the owner of the number called, whose settings build the call's brief.
+- A meeting for an owner other than `local` runs with that owner's OpenAI key, voice and name, given to the meeting container over the shared `.env`.
+- The TypeScript SDK talks to a remote daemon: `new Smitline({ baseUrl, token, headers })` sends the fixed token and the extra headers on every request, and never starts a daemon or reads `daemon.auth`.
+
 ## 0.2.1 — 2026-10-07
 
 - **Easier to find and to use from any agent.** Every MCP tool has a title and annotations (read-only, destructive, open-world), and the descriptions of `get_call`, `list_calls`, `list_contacts`, `send_call_instruction`, `check_call_brief` and `list_voices` say what they return, their errors and limits, and which tool to use instead. The registry listing has an icon and a description written the way people search ("make phone calls", "meetings"); the bundle's token is optional, so it installs before Smitline is set up, and says what to do when no token is set.

@@ -3,8 +3,9 @@ media, and inbound calls, plus OpenAI's signed webhook for calls handed to it ov
 
 Runs as its own listener on loopback (default 127.0.0.1:8766) so a tunnel or
 proxy can expose it without exposing the daemon API. Every HTTP callback must
-carry a valid X-Twilio-Signature. Media streams must present the per-call token
-that was placed in the TwiML when the call was created.
+carry a valid X-Twilio-Signature, checked with the phone credentials of the call's
+owner (for an incoming call, the owner of the number called). Media streams must
+present the per-call token that was placed in the TwiML when the call was created.
 """
 import asyncio
 import json
@@ -12,7 +13,9 @@ import secrets
 
 from aiohttp import WSMsgType, web
 
-from call_hooks import MissingCredentials
+from call_brief import normalize_phone
+from call_hooks import LOCAL_OWNER, MissingCredentials, maybe_await, owner_settings
+from call_service import CallError
 from call_store import CallNotFound
 from live_sip import incoming_call, verify_webhook
 from phone_line import inbound_brief
@@ -27,17 +30,25 @@ REJECT = '<?xml version="1.0" encoding="UTF-8"?><Response><Reject/></Response>'
 BUSY = '<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="busy"/></Response>'
 
 
-def create_gateway_app(line, service, *, current_url, owner='local'):
+def create_gateway_app(line, service, *, current_url, owner=LOCAL_OWNER):
     """current_url: returns the https origin Twilio uses to reach us right now, or None.
 
-    It must not start a tunnel: unsigned requests reach these routes too.
+    It must not start a tunnel: unsigned requests reach these routes too. `owner` is whose
+    credentials check what belongs to no known call, and OpenAI's installation-wide webhook.
     """
 
-    def keys():
+    def keys(for_owner):
         try:
-            return signing_keys(service.hooks.credentials(owner, 'twilio'))
+            return signing_keys(service.hooks.credentials(for_owner, 'twilio'))
         except MissingCredentials:
             return []
+
+    def call_owner(request):
+        """The owner of the call a callback is about."""
+        try:
+            return service.store.get(request.match_info['callId']).get('owner') or owner
+        except (CallNotFound, ValueError):
+            return owner
 
     def base_url():
         base = current_url()
@@ -45,22 +56,22 @@ def create_gateway_app(line, service, *, current_url, owner='local'):
             raise web.HTTPForbidden(text='no public address')
         return base.rstrip('/')
 
-    async def verified_params(request):
+    async def verified_params(request, for_owner):
         params = dict(await request.post())
         url = base_url() + request.path_qs
         provided = (request.headers.get('X-Twilio-Signature')
                     or request.headers.get('X-SignalWire-Signature'))
-        if not any(valid_signature(key, url, params, provided) for key in keys()):
+        if not any(valid_signature(key, url, params, provided) for key in keys(for_owner)):
             raise web.HTTPForbidden(text='invalid signature')
         return params
 
     async def status(request):
-        params = await verified_params(request)
+        params = await verified_params(request, call_owner(request))
         line.on_status(request.match_info['callId'], params)
         return web.Response(status=204)
 
     async def amd(request):
-        params = await verified_params(request)
+        params = await verified_params(request, call_owner(request))
         line.on_amd(request.match_info['callId'], params.get('AnsweredBy'))
         return web.Response(status=204)
 
@@ -90,7 +101,7 @@ def create_gateway_app(line, service, *, current_url, owner='local'):
         return ws
 
     async def recording(request):
-        params = await verified_params(request)
+        params = await verified_params(request, call_owner(request))
         if params.get('RecordingStatus', 'completed') == 'completed' and params.get('RecordingUrl'):
             try:
                 service.attach_recording(request.match_info['callId'],
@@ -107,23 +118,39 @@ def create_gateway_app(line, service, *, current_url, owner='local'):
         except ValueError:
             return DEFAULT_MAX_INBOUND
 
+    async def number_owner(number):
+        """Who an incoming call to `number` is for; None when nobody takes it."""
+        lookup = getattr(service.hooks, 'owner_for_number', None)
+        if lookup is not None:
+            return await maybe_await(lookup(number))
+        return owner if line.environ().get('SMITLINE_ACCEPT_INBOUND') == '1' else None
+
     async def inbound(request):
-        params = await verified_params(request)
-        env = line.environ()
-        if env.get('SMITLINE_ACCEPT_INBOUND') != '1':
+        try:
+            called = normalize_phone((await request.post()).get('To') or '', 'To')
+        except ValueError:
+            called = None
+        called_owner = await number_owner(called)
+        params = await verified_params(request, called_owner or owner)
+        if called_owner is None:
             return web.Response(text=REJECT, content_type=XML)
+        env = line.environ()
         if service.active_count(direction='inbound') >= max_inbound(env):
             return web.Response(text=BUSY, content_type=XML)
         caller = params.get('From') or ''
         call_sid = params.get('CallSid') or ''
         try:
-            brief = inbound_brief(env, caller)
+            brief = inbound_brief(owner_settings(service.hooks, called_owner), caller)
         except ValueError:
             return web.Response(text=REJECT, content_type=XML)
         token = secrets.token_urlsafe(24)
-        record = await service.create_inbound(
-            brief, owner,
-            lambda ctx: line.start_inbound(ctx, call_sid=call_sid, token=token))
+        try:
+            record = await service.create_inbound(
+                brief, called_owner,
+                lambda ctx: line.start_inbound(ctx, call_sid=call_sid, token=token))
+        except CallError:
+            # The owner's hooks refused the call (no credit, say): turn it away.
+            return web.Response(text=REJECT, content_type=XML)
         for _ in range(50):
             if line.session(record['id']) is not None:
                 break

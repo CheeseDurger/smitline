@@ -161,7 +161,7 @@ Every finished call carries `cost`, in US dollars:
 | `GET /v1/calls/{id}/events` | Server-sent events with `Last-Event-ID` resume. Add `?format=json&after=N` for a JSON page of events after event `N`, as the local console does. |
 | `notify.webhookUrl` | One `POST` when the call reaches a terminal status. |
 
-Webhook bodies are signed: `X-Smitline-Signature: sha256=<hex HMAC of the raw body>` with the per-installation secret in `.smitline/daemon-data/webhook.secret`. Only `https://` URLs are accepted, plus `http://127.0.0.1` and `http://localhost` for local agents; an https URL may not name a private, loopback, or link-local IP address, and a host name that resolves to one is refused at delivery (`rejected`, with no request sent) unless `SMITLINE_WEBHOOK_ALLOW_PRIVATE=1`. Delivery is retried three times with backoff. The outcome is recorded as a `call.webhook` event with `delivered`, `attempts`, and a coarse `error` (`rejected`, `failed`, or `unreachable`), never the receiver's exact response.
+Webhook bodies are signed: `X-Smitline-Signature: sha256=<hex HMAC of the raw body>` with the per-installation secret in `.smitline/daemon-data/webhook.secret` (an owner other than the local one has its own, in `.smitline/owners/<owner>/webhook.secret`; see [owners](#owners)). Only `https://` URLs are accepted, plus `http://127.0.0.1` and `http://localhost` for local agents; an https URL may not name a private, loopback, or link-local IP address, and a host name that resolves to one is refused at delivery (`rejected`, with no request sent) unless `SMITLINE_WEBHOOK_ALLOW_PRIVATE=1`. Delivery is retried three times with backoff. The outcome is recorded as a `call.webhook` event with `delivered`, `attempts`, and a coarse `error` (`rejected`, `failed`, or `unreachable`), never the receiver's exact response.
 
 ## Reliability
 
@@ -192,7 +192,7 @@ Webhook bodies are signed: `X-Smitline-Signature: sha256=<hex HMAC of the raw bo
 
 ### Meetings API
 
-The local console starts meetings with these endpoints. Agents should use `/v1/calls` instead, which returns a result.
+The local console starts meetings with these endpoints. Agents should use `/v1/calls` instead, which returns a result. They act for the local owner only: a request for another [owner](#owners) gets `403 local_owner_only`, and so does every request when `SMITLINE_REQUIRE_OWNER=1`.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -209,20 +209,45 @@ The call service calls a small hooks object so a managed deployment can add acco
 
 | Hook | Default |
 | --- | --- |
-| `owner_for(request)` | `local` |
-| `credentials(owner, provider)` | Reads `OPENAI_API_KEY` and `TWILIO_*` from the environment. |
-| `precheck(owner, brief)` | For phone calls, applies the country allow-list and the [guardrails](phone.md#guardrails). |
-| `do_not_call(owner)`, `update_do_not_call(owner, update)` | Read and change `.smitline/do-not-call.json`. Without them, `/v1/do-not-call` returns `501` and a request not to be called again is only reported in the result. |
+| `owner_for(request)` | The [owner](#owners) of the request: `local` unless an API token says otherwise. |
+| `settings(owner)` | What one owner's calls read: the environment overlaid with `.env`, the same for every owner. |
+| `storage_root(owner)` | `.smitline` next to `.env` for `local`; `.smitline/owners/<owner>` for any other owner. |
+| `credentials(owner, provider)` | Reads `OPENAI_API_KEY` and `TWILIO_*` (or `SIGNALWIRE_*`) from the environment; the number calls show is `SMITLINE_CALLER_ID` from `settings(owner)`, else the provider number. |
+| `brief_defaults(owner, payload)` | Fills `onBehalfOf` (and a rehearsal's `to`) from `SMITLINE_OWNER_NAME` and `SMITLINE_OWNER_PHONE` in `settings(owner)`. |
+| `precheck(owner, brief)` | For phone calls, applies the country allow-list and the [guardrails](phone.md#guardrails) from `settings(owner)`; repeat limits count only this owner's calls. |
+| `call_started(owner, record)` | Nothing. Runs once the call is recorded, before its line starts. Raising `CallRefused` ends the call as `failed` (`endReason: refused`) and answers with the refusal; any other error ends it too, with `503 call_start_failed`. |
+| `contact_book(owner)` | The owner's saved contacts, `contacts.json` under `storage_root(owner)`. |
+| `do_not_call(owner)`, `update_do_not_call(owner, update)` | Read and change `do-not-call.json` under `storage_root(owner)` (`.smitline/do-not-call.json` for `local`). Without them, `/v1/do-not-call` returns `501` and a request not to be called again is only reported in the result. |
 | `record_usage(owner, call, usage)` | Appends a line to `usage.jsonl` in the call store. |
-| `notify(owner, call)` | Sends the brief's webhook, if any. |
-| `profile(owner)`, `save_profile(owner, profile)` | Read and write `.smitline/profile.json` next to `.env`. Without them, calls get no profile and `/v1/profile` returns `501`. |
+| `notify(owner, call)` | Sends the brief's webhook, if any, signed with `webhook_secret(owner)`. |
+| `webhook_secret(owner)` | The installation's secret for `local`; for any other owner a secret of its own, made on first use in `webhook.secret` under `storage_root(owner)`. |
+| `owner_for_number(number)` | Who an incoming call to `number` (E.164, or `None` when the provider sent none) is for: `local` when `SMITLINE_ACCEPT_INBOUND=1`, else `None`, which turns the call away. |
+| `profile(owner)`, `save_profile(owner, profile)` | Read and write `profile.json` under `storage_root(owner)` (`.smitline/profile.json` next to `.env` for `local`). Without them, calls get no profile and `/v1/profile` returns `501`. |
 
-Set `SMITLINE_CALL_HOOKS=module:factory` to load different hooks.
+Set `SMITLINE_CALL_HOOKS=module:factory` to load different hooks. The factory receives the default hooks' keyword arguments (`environ`, `env_file`, `store`, `notifier`, `clock`); subclassing `DefaultCallHooks` and overriding only what changes keeps everything else. Only `owner_for`, `credentials`, `precheck`, `record_usage` and `notify` are required; the call service falls back to the environment without `settings`, and treats a `contact_book` attribute (one book) as the local owner's.
+
+A hook refuses with `CallRefused(code, message, status=403, **details)`. The API answers `status` with `{"error": {"code", "message", ...details}}`, so a hosted service can answer `402 insufficient_credit` with `balance` and `topUpUrl`, or `429 too_many_active_calls`. `POST /v1/calls/check` lists the message among its `problems`.
+
+### Owners
+
+Every call record, meeting, profile, contact book and do-not-call list belongs to one owner, an id of lowercase letters, digits, `_` and `-` (at most 64 characters, starting with a letter or digit). A self-hosted installation has one owner, `local`, and keeps its files where they always were. Reading or changing another owner's call or meeting answers `404`, as if it did not exist.
+
+`owner_for(request)` decides the owner from the credential the daemon verified, which it keeps as `request['smitline_auth']`: `{"kind": "launch"}` for the per-launch token, `{"kind": "api", "token": {"id", "name", "kind", "owner"}}` for an API token.
+
+- An API token created with `--owner OWNER` always acts as that owner.
+- An API token created with `--kind internal` (a hosted service's gateway) names the owner of each request with `X-Smitline-Owner: OWNER`. From any other credential the header is refused with `403 owner_header_forbidden`; an id that is not an owner id is `400 invalid_owner`.
+- Everything else is `local`.
+
+`SMITLINE_REQUIRE_OWNER=1`, for a deployment that serves accounts, refuses a request that would act as `local` with `401 owner_required`, closes the meetings API, and turns away incoming calls unless `owner_for_number` names an owner.
+
+These settings are read per owner, through `settings(owner)`: `SMITLINE_OWNER_NAME`, `SMITLINE_OWNER_PHONE`, `SMITLINE_CALLER_ID`, `SMITLINE_VOICE`, `SMITLINE_EXTRA_VOICES`, `SMITLINE_ALLOWED_CALLING_CODES`, `SMITLINE_CALLING_HOURS`, `SMITLINE_MAX_CALLS_PER_NUMBER`, `SMITLINE_MAX_CALLS_PER_HOUR`, `SMITLINE_ALLOW_PREMIUM_NUMBERS`, `SMITLINE_RECORD_CALLS`, `SMITLINE_NOTIFY_WEBHOOK` (incoming calls) and `SMITLINE_PARTICIPANT_NAME`. Provider keys, prices, models and the audio mode stay installation-wide.
+
+Phone callbacks are checked with the credentials of the call's owner, and an incoming call with those of the owner `owner_for_number` gives for the number called, whose settings build its brief. A meeting for an owner other than `local` gets that owner's `OPENAI_API_KEY`, and `SMITLINE_VOICE`, `SMITLINE_PARTICIPANT_NAME` and `SMITLINE_OWNER_NAME` from its settings, over the shared `.env`: the daemon writes them to a private file for `docker compose`, which reads it after `.env` and `.env.meeting` (`SMITLINE_MEETING_ENV_FILE`), and deletes it once the container is created.
 
 ## Access
 
 The daemon listens on loopback with a per-launch token by default. The token is in `.smitline/daemon.auth` (`/data/.smitline/daemon.auth` in the image) and changes each time the daemon starts.
 
-Server mode also accepts long-lived API tokens; only SHA-256 digests are stored. It refuses to start without at least one API token and must sit behind a TLS-terminating proxy. From a checkout, create a token with `python3 meeting-runtime/api_tokens.py create --name NAME`, then start the daemon with `SMITLINE_SERVER_MODE=1 SMITLINE_DAEMON_HOST=0.0.0.0 ./start-runtime-daemon.sh`. In the image, create the token as the `app` user, so the file stays readable to the daemon: `docker exec -u app smitline python meeting-runtime/api_tokens.py --root /data create --name NAME`. The container's start script reads the same two variables, so pass `-e SMITLINE_SERVER_MODE=1 -e SMITLINE_DAEMON_HOST=0.0.0.0` to `docker run`.
+Server mode also accepts long-lived API tokens; only SHA-256 digests are stored. It refuses to start without at least one API token and must sit behind a TLS-terminating proxy. From a checkout, create a token with `python3 meeting-runtime/api_tokens.py create --name NAME` (add `--owner OWNER` for a token that acts as another [owner](#owners), or `--kind internal` for a gateway that names the owner per request), then start the daemon with `SMITLINE_SERVER_MODE=1 SMITLINE_DAEMON_HOST=0.0.0.0 ./start-runtime-daemon.sh`. In the image, create the token as the `app` user, so the file stays readable to the daemon: `docker exec -u app smitline python meeting-runtime/api_tokens.py --root /data create --name NAME`. The container's start script reads the same two variables, so pass `-e SMITLINE_SERVER_MODE=1 -e SMITLINE_DAEMON_HOST=0.0.0.0` to `docker run`.
 
 Credentials come from the process environment first, then the ignored `.env` (`/data/.env` in the image), which is reread for every call, so keys added during setup work without a restart.
