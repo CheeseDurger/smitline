@@ -174,14 +174,42 @@ function defaultSpawnDaemon({ root, codeRoot, host, port }) {
     },
   });
 }
+function remoteOrigin(baseUrl) {
+  let url;
+  try {
+    url = new URL(String(baseUrl));
+  } catch {
+    throw new ValidationError('baseUrl must be an http or https URL');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new ValidationError('baseUrl must be an http or https URL');
+  }
+  return url.href.replace(/\/+$/, '');
+}
+
+/**
+ * A daemon on another host (a hosted deployment, server mode): every request carries the
+ * fixed bearer token and the extra headers. It never starts a daemon or reads daemon.auth.
+ */
+export function createRemoteTransport(options = {}) {
+  if (typeof options.token !== 'string' || !options.token) {
+    throw new ValidationError('a remote daemon needs a token');
+  }
+  return createLoopbackTransport({ ...options, remote: true });
+}
+
 export function createLoopbackTransport(options = {}) {
+  const remote = options.remote === true;
   const fsApi = options.fs || { readFile };
   const root = options.root || process.env.SMITLINE_ROOT || process.cwd();
   const codeRoot = options.codeRoot || root;
   const managed = options.managed ?? isManaged();
   const host = options.host || '127.0.0.1';
   const port = Number(options.port || process.env.SMITLINE_DAEMON_PORT || 8765);
-  const origin = `http://${host}:${port}`;
+  const origin = remote ? remoteOrigin(options.baseUrl) : `http://${host}:${port}`;
+  // The bearer token is always this transport's own.
+  const extraHeaders = Object.fromEntries(Object.entries(options.headers || {})
+    .filter(([name]) => name.toLowerCase() !== 'authorization'));
   const fetchImpl = options.fetchImpl || globalThis.fetch.bind(globalThis);
   // Managed: the container owns the daemon, so it is never started from here.
   const spawnDaemon = managed ? null : options.spawnDaemon === undefined
@@ -189,9 +217,10 @@ export function createLoopbackTransport(options = {}) {
     : options.spawnDaemon;
   const isPortOpen = options.isPortOpen || ((checkHost, checkPort) => defaultIsPortOpen(checkHost, checkPort));
   let starting = null;
-  let token = '';
+  let token = remote ? options.token : '';
 
   async function ensureDaemon() {
+    if (remote) return;
     if (await isPortOpen(host, port)) {
       token = token || await readAuth();
       if (!token) {
@@ -222,6 +251,7 @@ export function createLoopbackTransport(options = {}) {
   }
 
   async function readAuth() {
+    if (remote) return token;
     if (options.readAuth) return options.readAuth();
     if (!fsApi?.readFile) return token;
     return readDaemonAuth(root, fsApi);
@@ -231,6 +261,7 @@ export function createLoopbackTransport(options = {}) {
     await ensureDaemon();
     if (!token) token = await readAuth();
     const requestHeaders = {
+      ...extraHeaders,
       ...headers,
       Authorization: `Bearer ${token}`,
     };
@@ -246,7 +277,7 @@ export function createLoopbackTransport(options = {}) {
     } catch (error) {
       throw new StartupError(redact(error.message || 'daemon unreachable'), { code: 'daemon_unavailable' });
     }
-    if (response.status === 401 && !retried) {
+    if (response.status === 401 && !retried && !remote) {
       token = await readAuth();
       if (token) return request(method, path, { body, headers, signal }, true);
     }
@@ -338,7 +369,9 @@ export function createLoopbackTransport(options = {}) {
 
 export class Smitline {
   constructor(options = {}) {
-    this._transport = options.transport || createLoopbackTransport(options);
+    // baseUrl: a remote daemon with a fixed token (and headers); otherwise the local daemon.
+    this._transport = options.transport
+      || (options.baseUrl ? createRemoteTransport(options) : createLoopbackTransport(options));
   }
 
   /** Validate a call brief and report missing configuration without dialing. */

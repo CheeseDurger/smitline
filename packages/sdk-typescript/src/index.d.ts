@@ -202,6 +202,14 @@ export interface SmitlineOptions {
   managed?: boolean;
   host?: string;
   port?: number;
+  /** A remote daemon (a hosted deployment, or server mode) instead of the local one. */
+  baseUrl?: string;
+  /** The bearer token for baseUrl, sent as is; daemon.auth is never read. */
+  token?: string;
+  /** Extra headers on every request to baseUrl, e.g. X-Smitline-Owner from an internal token. */
+  headers?: Record<string, string>;
+  /** Start the local daemon when it is not running (default true); never for baseUrl. */
+  autostart?: boolean;
 }
 
 export class Smitline {
@@ -242,6 +250,14 @@ export function createLoopbackTransport(options?: {
   readAuth?: () => Promise<string>;
   spawnDaemon?: ((options: { root: string; codeRoot: string; host: string; port: number }) => { unref?: () => void }) | null;
   isPortOpen?: (host: string, port: number) => Promise<boolean>;
+}): DaemonTransport;
+
+/** A daemon on another host: a fixed bearer token and extra headers, never started from here. */
+export function createRemoteTransport(options: {
+  baseUrl: string;
+  token: string;
+  headers?: Record<string, string>;
+  fetchImpl?: typeof fetch;
 }): DaemonTransport;
 
 export const MANAGED_NOT_RUNNING: string;

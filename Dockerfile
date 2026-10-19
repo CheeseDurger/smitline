@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini \
 
 WORKDIR /app
 COPY --from=node /app/node_modules ./node_modules
-COPY package.json compose.meeting.image.yaml start-meeting-agent.sh ./
+COPY package.json compose.meeting.image.yaml compose.meeting.pool.image.yaml start-meeting-agent.sh ./
 COPY .agents ./.agents
 COPY docker ./docker
 COPY packages ./packages

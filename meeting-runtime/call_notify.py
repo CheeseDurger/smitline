@@ -91,7 +91,9 @@ class WebhookNotifier:
             'call': call,
         }
 
-    async def deliver(self, call):
+    async def deliver(self, call, *, secret=None):
+        """Post the finished call to its brief's webhook, signed with `secret` (the owner's)
+        or, by default, this installation's secret."""
         url = ((call.get('brief') or {}).get('notify') or {}).get('webhookUrl')
         if not url:
             return None
@@ -103,7 +105,7 @@ class WebhookNotifier:
             'Content-Type': 'application/json',
             'User-Agent': 'smitline-webhook/1',
             'X-Smitline-Event': 'call.' + call['status'],
-            'X-Smitline-Signature': signature(self.secret, body),
+            'X-Smitline-Signature': signature(secret or self.secret, body),
         }
         # Outcomes are coarse on purpose: the result is readable by API callers, so
         # it must not become a probe of the receiver's exact responses.

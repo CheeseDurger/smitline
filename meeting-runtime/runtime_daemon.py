@@ -10,10 +10,12 @@ import json
 import os
 import secrets
 import threading
+import warnings
 
 from aiohttp import web
 
 from agent_sessions import MeetingSession, optional_on_behalf_of, optional_voice
+from call_hooks import LOCAL_OWNER, CallRefused, maybe_await, owner_required
 from context_handoff import ContextHandoff
 from event_store import JsonlEventStore
 from meeting_handoff import MeetingHandoff
@@ -37,6 +39,10 @@ LIFECYCLE_EVENTS = {
     'live': 'meeting.live',
     'ended': 'meeting.ended',
 }
+# Call hooks, which may live outside this package, read the verified credential from the
+# plain request['smitline_auth'] key; aiohttp's advice to use typed keys is not for them.
+warnings.filterwarnings('ignore', message='It is recommended to use web.RequestKey',
+                        module='runtime_daemon')
 DEFAULT_MAX_BODY = 256 * 1024
 DEFAULT_SSE_POLL = 0.05
 DEFAULT_SSE_HEARTBEAT = 15.0
@@ -207,12 +213,13 @@ class RuntimeDaemon:
             return None
         return self._append(meeting_id, event_type, **payload)
 
-    def _record(self, meeting_id):
+    def _record(self, meeting_id, owner=None):
+        """The meeting's record; with an owner, another owner's meeting is not found."""
         try:
             record = self.meetings.get(meeting_id)
         except MeetingCorruptionError as error:
             raise DaemonError(409, 'corrupt_snapshot', str(error)) from error
-        if record is None:
+        if record is None or (owner is not None and record.session.owner != owner):
             raise DaemonError(404, 'not_found', 'meeting not found')
         return record
 
@@ -256,7 +263,7 @@ class RuntimeDaemon:
             self._persist_create_abort(session, reason)
         raise self._create_failure(error, phase) from error
 
-    async def create_meeting(self, payload):
+    async def create_meeting(self, payload, *, owner=LOCAL_OWNER):
         if not isinstance(payload, dict):
             raise DaemonError(422, 'invalid_request', 'meeting must be an object')
         try:
@@ -285,6 +292,7 @@ class RuntimeDaemon:
                 'cameraEnabled': camera['enabled'],
                 'cameraState': 'off' if not camera['enabled'] else 'starting',
                 'visualState': 'joining',
+                'owner': owner,
             })
         except (TypeError, ValueError) as error:
             raise DaemonError(422, 'invalid_request', str(error)) from error
@@ -312,17 +320,17 @@ class RuntimeDaemon:
             except Exception as error:
                 await self._abort_create(session, started, phase, error)
 
-    async def get_meeting(self, meeting_id):
-        return self._record(meeting_id).session
+    async def get_meeting(self, meeting_id, *, owner=None):
+        return self._record(meeting_id, owner).session
 
-    async def update_context(self, meeting_id, payload):
+    async def update_context(self, meeting_id, payload, *, owner=None):
         try:
             context = ContextHandoff.from_dict(payload)
         except (TypeError, ValueError) as error:
             raise DaemonError(422, 'invalid_request', str(error)) from error
         async with self._async_lock(meeting_id):
             with self._serialize_writes(meeting_id):
-                record = self._record(meeting_id)
+                record = self._record(meeting_id, owner)
                 if record.session.state == 'ended':
                     raise DaemonError(409, 'conflict', 'cannot update context after the meeting has ended')
                 updated = self._replace_session(record.session, context=context.to_dict())
@@ -337,10 +345,10 @@ class RuntimeDaemon:
                     'meeting supervisor failed to update context') from error
             return updated
 
-    async def cancel_meeting(self, meeting_id):
+    async def cancel_meeting(self, meeting_id, *, owner=None):
         async with self._async_lock(meeting_id):
             with self._serialize_writes(meeting_id):
-                record = self._record(meeting_id)
+                record = self._record(meeting_id, owner)
                 if record.session.state == 'ended':
                     return record.session
             try:
@@ -360,8 +368,8 @@ class RuntimeDaemon:
                 self._append_once(meeting_id, 'meeting.ended', reason='cancelled')
                 return ended
 
-    async def get_handoff(self, meeting_id):
-        record = self._record(meeting_id)
+    async def get_handoff(self, meeting_id, *, owner=None):
+        record = self._record(meeting_id, owner)
         if record.handoff is None:
             raise DaemonError(404, 'not_found', 'handoff is not ready')
         return record.handoff
@@ -527,16 +535,23 @@ def create_app(
         if request.path.startswith('/v1/'):
             header = request.headers.get('Authorization', '')
             scheme, _, credential = header.partition(' ')
-            accepted = scheme == 'Bearer' and bool(credential) and (
-                _bearer_matches(credential, token)
-                or (api_tokens is not None and api_tokens.verify(credential) is not None))
-            if not accepted:
+            auth = None
+            if scheme == 'Bearer' and credential:
+                if _bearer_matches(credential, token):
+                    auth = {'kind': 'launch'}
+                elif api_tokens is not None:
+                    verified = api_tokens.verify(credential)
+                    if verified is not None:
+                        auth = {'kind': 'api', 'token': verified}
+            if auth is None:
                 # A competing startup can rotate the host-only file before it
                 # discovers that this daemon already owns the port. Restore the
                 # live daemon's credential so local clients can reread and retry.
                 if on_auth_token is not None:
                     on_auth_token(token)
                 return _json_error(401, 'unauthorized', 'authorization required')
+            # The call hooks read the verified credential to decide the request's owner.
+            request['smitline_auth'] = auth
         return await handler(request)
 
     @web.middleware
@@ -580,32 +595,55 @@ def create_app(
         reject_secrets(payload, 'request')
         return payload
 
+    async def local_owner(request):
+        """The raw meeting API acts for the local owner only; other owners start meetings as
+        calls. A deployment with SMITLINE_REQUIRE_OWNER=1 has no local owner, so it is closed."""
+        hooks = getattr(call_service, 'hooks', None)
+        if hooks is None:
+            return LOCAL_OWNER
+        if owner_required(getattr(hooks, 'environ', os.environ)):
+            raise DaemonError(403, 'local_owner_only', 'This deployment starts meetings as calls: '
+                              'POST /v1/calls with channel meeting.')
+        try:
+            owner = await maybe_await(hooks.owner_for(request))
+        except CallRefused as error:
+            raise DaemonError(error.status, error.code, error.message) from error
+        if owner != LOCAL_OWNER:
+            raise DaemonError(403, 'local_owner_only', 'The /v1/meetings API acts for the local '
+                              'owner only: POST /v1/calls with channel meeting.')
+        return owner
+
     async def create_meeting(request):
+        owner = await local_owner(request)
         payload = await read_json(request)
-        session = await daemon.create_meeting(payload)
+        session = await daemon.create_meeting(payload, owner=owner)
         return _public_json(daemon.public_meeting(session), status=201)
 
     async def get_meeting(request):
-        session = await daemon.get_meeting(request.match_info['meetingId'])
+        session = await daemon.get_meeting(request.match_info['meetingId'],
+                                           owner=await local_owner(request))
         return _public_json(daemon.public_meeting(session))
 
     async def update_context(request):
+        owner = await local_owner(request)
         payload = await read_json(request)
-        session = await daemon.update_context(request.match_info['meetingId'], payload)
+        session = await daemon.update_context(request.match_info['meetingId'], payload, owner=owner)
         return _public_json(daemon.public_meeting(session))
 
     async def cancel_meeting(request):
+        owner = await local_owner(request)
         await read_json(request, allow_empty=True)
-        session = await daemon.cancel_meeting(request.match_info['meetingId'])
+        session = await daemon.cancel_meeting(request.match_info['meetingId'], owner=owner)
         return _public_json(daemon.public_meeting(session))
 
     async def get_handoff(request):
-        handoff = await daemon.get_handoff(request.match_info['meetingId'])
+        handoff = await daemon.get_handoff(request.match_info['meetingId'],
+                                           owner=await local_owner(request))
         return _public_json(handoff.to_dict())
 
     async def get_events(request):
         meeting_id = request.match_info['meetingId']
-        daemon._record(meeting_id)
+        daemon._record(meeting_id, await local_owner(request))
         headers = {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',

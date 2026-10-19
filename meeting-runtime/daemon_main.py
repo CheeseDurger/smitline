@@ -39,6 +39,18 @@ def build_parser():
     return parser
 
 
+def shutdown_grace(env):
+    """SMITLINE_SHUTDOWN_GRACE: seconds a stop gives calls in progress to end and report what
+    they used (default 5; 0 cuts them off at once)."""
+    import math
+    from call_service import SHUTDOWN_GRACE
+    try:
+        seconds = float(str(env.get('SMITLINE_SHUTDOWN_GRACE') or SHUTDOWN_GRACE).strip())
+    except ValueError:
+        return SHUTDOWN_GRACE
+    return seconds if math.isfinite(seconds) and seconds >= 0 else SHUTDOWN_GRACE
+
+
 def build_call_service(project_root, data_root, daemon, lines=None, gateway_port=None,
                        runtime_root=None):
     from call_hooks import load_hooks, read_env_file
@@ -67,7 +79,7 @@ def build_call_service(project_root, data_root, daemon, lines=None, gateway_port
     meeting = MeetingLine(daemon, transcript=lambda meeting_id: meeting_transcript(recordings, meeting_id))
     available = {'meeting': meeting, 'phone': phone}
     available.update(lines or {})
-    service = CallService(store, hooks=hooks, lines=available)
+    service = CallService(store, hooks=hooks, lines=available, shutdown_grace=shutdown_grace(startup_env))
     service.phone_line = phone
     service.public_url = public
     service.gateway_port = port
@@ -133,6 +145,19 @@ def attach_phone_gateway(app, service):
     app.on_cleanup.append(stop_gateway)
 
 
+def build_supervisor(project_root, runtime_root, environ=None):
+    """One meeting container at the fixed ports (SMITLINE_MAX_MEETINGS=1, the default), or a
+    pool of them. A deployment that serves accounts (SMITLINE_REQUIRE_OWNER=1) always uses the
+    pool, which keeps each meeting's folders and browser profiles apart."""
+    from call_hooks import owner_required, read_env_file
+    from meeting_supervisor import MeetingPool, pool_settings
+    env = environ if environ is not None else {**read_env_file(project_root / '.env'), **os.environ}
+    settings = pool_settings(env)
+    if settings['max_meetings'] == 1 and not owner_required(env):
+        return ProductionMeetingSupervisor(project_root, runtime_root=runtime_root)
+    return MeetingPool(project_root, runtime_root=runtime_root, **settings)
+
+
 def build_app(args):
     project_root = Path(args.root).resolve()
     old_names.migrate_data(project_root)
@@ -147,7 +172,7 @@ def build_app(args):
     def publish_auth_token(current_token):
         write_private_file(token_path, current_token + '\n')
 
-    supervisor = ProductionMeetingSupervisor(project_root, runtime_root=runtime_root)
+    supervisor = build_supervisor(project_root, runtime_root)
     app = create_app(
         root=data_root,
         bind_host=host,
@@ -160,6 +185,12 @@ def build_app(args):
         server_mode=args.server,
     )
     supervisor.bind_daemon(app.runtime_daemon)
+    if not supervisor.local_only:
+        # A pool meeting's container gets only what the meeting reads, never .env wholesale.
+        # One container at a time runs the local owner's meetings only, which read .env.
+        from meeting_line import pool_meeting_environment
+        supervisor.owner_environment = lambda owner: pool_meeting_environment(
+            app.call_service.hooks, owner, project_root / '.env.meeting')
     attach_phone_gateway(app, app.call_service)
     app.meeting_supervisor = supervisor
     app.auth_token_path = token_path
