@@ -15,7 +15,7 @@ MEETING_PLATFORMS = ('zoom', 'teams', 'meet')
 MEETING_STATES = ('joining', 'waiting_for_admission', 'live', 'ended')
 MEETING_SESSION_FIELDS = (
     'id', 'platform', 'meetingUrl', 'context', 'onBehalfOf', 'voice', 'state', 'startedAt',
-    'cameraEnabled', 'cameraState', 'visualState', 'degradedReason',
+    'cameraEnabled', 'cameraState', 'visualState', 'degradedReason', 'owner',
 )
 # Fields older snapshots stored for coding-agent sessions; ignored when read back.
 LEGACY_SESSION_FIELDS = ('agentSession', 'permissions')
@@ -54,6 +54,16 @@ def optional_voice(value, environ=None):
     return name
 
 
+def optional_owner(value):
+    """The owner a meeting belongs to; records written before owners belong to 'local'."""
+    from call_hooks import LOCAL_OWNER, valid_owner
+    if value is None:
+        return LOCAL_OWNER
+    if not valid_owner(value):
+        raise ValueError('owner must be an owner id')
+    return value
+
+
 def upgrade_legacy_session(payload):
     """Map a snapshot written before coding-agent sessions were removed onto today's fields."""
     payload = dict(payload)
@@ -85,6 +95,7 @@ class MeetingSession:
     camera_state: str = None
     visual_state: str = None
     degraded_reason: str = None
+    owner: str = 'local'
 
     def to_dict(self):
         return omit_none({
@@ -100,6 +111,8 @@ class MeetingSession:
             'cameraState': self.camera_state,
             'visualState': self.visual_state,
             'degradedReason': self.degraded_reason,
+            # The local owner's meetings are stored and shown exactly as before owners existed.
+            'owner': None if self.owner == 'local' else self.owner,
         })
 
     @classmethod
@@ -133,4 +146,5 @@ class MeetingSession:
                                         VISUAL_STATES),
             degraded_reason=_optional_enum(optional_field(payload, 'degradedReason'),
                                            'degradedReason', DEGRADED_REASONS),
+            owner=optional_owner(optional_field(payload, 'owner')),
         )

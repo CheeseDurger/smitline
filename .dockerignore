@@ -3,6 +3,7 @@
 !package.json
 !package-lock.json
 !compose.meeting.image.yaml
+!compose.meeting.pool.image.yaml
 !start-meeting-agent.sh
 !.agents/
 !docker/

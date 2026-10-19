@@ -2,7 +2,18 @@
 import asyncio
 
 from briefing import EARLIER_CALLS_HEADING
+from call_hooks import LOCAL_OWNER, CallRefused, owner_settings, read_env_file
 
+# What an owner's settings give its meeting container, over the shared .env.
+MEETING_SETTINGS = ('SMITLINE_VOICE', 'SMITLINE_PARTICIPANT_NAME', 'SMITLINE_OWNER_NAME')
+# Everything a pool meeting's container reads from its environment besides OPENAI_API_KEY
+# (bridge.py, runtime_config.py, meeting_intro.py; test_meeting_pool checks this against the
+# code). Nothing else of the installation's settings reaches it. The first four are per owner.
+POOL_OWNER_SETTINGS = MEETING_SETTINGS + ('SMITLINE_EXTRA_VOICES',)
+POOL_MEETING_SETTINGS = POOL_OWNER_SETTINGS + (
+    'SMITLINE_MEETING_BACKEND_MODEL', 'SMITLINE_MEETING_WEB_SEARCH', 'SMITLINE_MEETING_INSTRUCTIONS',
+    'SMITLINE_MEETING_INTRO', 'SMITLINE_MEETING_CAMERA_STYLE',
+)
 MEETING_STATUS = {
     'joining': 'connecting',
     'waiting_for_admission': 'waiting',
@@ -37,6 +48,32 @@ def context_from_brief(brief):
     }
 
 
+def meeting_environment(hooks, owner):
+    """The OpenAI key, voice, and name a meeting for `owner` runs with. A setting the owner
+    has not set is blank, never the shared .env's value, which is the installation's."""
+    env = {'OPENAI_API_KEY': hooks.credentials(owner, 'openai')['apiKey']}
+    settings = owner_settings(hooks, owner)
+    env.update({key: str(settings.get(key) or '') for key in MEETING_SETTINGS})
+    return env
+
+
+def pool_meeting_environment(hooks, owner, meeting_env_file=None):
+    """Everything a pool meeting's container gets, and nothing else: the OpenAI key from
+    credentials(owner) and the settings in POOL_MEETING_SETTINGS, from the owner's settings
+    with .env.meeting over them (for another owner, .env.meeting sets only the installation-wide
+    ones). Provider keys, SIP and webhook secrets, and the rest of .env never reach it. A
+    setting nobody set is left out; a value with a control character is left out too."""
+    settings = owner_settings(hooks, owner)
+    values = {key: settings.get(key) for key in POOL_MEETING_SETTINGS}
+    for key, value in read_env_file(meeting_env_file).items():
+        if key in values and (owner == LOCAL_OWNER or key not in POOL_OWNER_SETTINGS):
+            values[key] = value
+    env = {key: str(value) for key, value in values.items()
+           if value and not any(ord(char) < 32 or ord(char) == 127 for char in str(value))}
+    env['OPENAI_API_KEY'] = hooks.credentials(owner, 'openai')['apiKey']
+    return env
+
+
 def meeting_payload(brief):
     # The meeting's opening disclosure names onBehalfOf; a brief's voice overrides SMITLINE_VOICE.
     payload = {
@@ -69,6 +106,15 @@ class MeetingLine:
         self._over_time = set()
 
     def ready(self, hooks, owner, brief):
+        # No meeting container for it (the one container runs the local owner's meetings only,
+        # or is busy; the pool is full, or out of ports): refused now, with the code, rather
+        # than after the call was accepted. The supervisor checks again when it starts, for
+        # calls that race.
+        problem = getattr(getattr(self.daemon, 'supervisor', None), 'capacity_problem', None)
+        problem = problem(owner) if callable(problem) else None
+        if problem:
+            status, code, message = problem
+            raise CallRefused(code, message, status=status)
         hooks.credentials(owner, 'openai')
 
     def _now(self):
@@ -80,7 +126,7 @@ class MeetingLine:
         ctx.set_status('connecting')
         self._starting.add(ctx.call_id)
         try:
-            session = await self.daemon.create_meeting(meeting_payload(ctx.brief))
+            session = await self.daemon.create_meeting(meeting_payload(ctx.brief), owner=ctx.owner)
         finally:
             self._starting.discard(ctx.call_id)
         self._meetings[ctx.call_id] = session.id
@@ -95,7 +141,7 @@ class MeetingLine:
         started = None
         limit = ctx.brief.max_minutes * 60
         while True:
-            session = await self.daemon.get_meeting(meeting_id)
+            session = await self.daemon.get_meeting(meeting_id, owner=ctx.owner)
             if session.state != last:
                 last = session.state
                 if session.state == 'live' and started is None:
@@ -104,13 +150,15 @@ class MeetingLine:
                 if status:
                     ctx.set_status(status)
             if session.state == 'ended':
+                # Meeting time ends here, not when the handoff arrives up to a few minutes later.
+                ended = self._now()
                 break
             if started is not None and self._now() - started >= limit and ctx.call_id not in self._over_time:
                 self._over_time.add(ctx.call_id)
                 ctx.event('call.max_duration')
                 await self.daemon.cancel_meeting(meeting_id)
             await self._sleep(self.poll_interval)
-        handoff = await self._await_handoff(meeting_id)
+        handoff = await self._await_handoff(meeting_id, ctx.owner)
         # The result is judged from what was said, so the call gets the meeting's transcript.
         try:
             entries = self._transcript(meeting_id)
@@ -118,7 +166,7 @@ class MeetingLine:
             entries = []
         for entry in entries:
             ctx.add_transcript(entry['speaker'], entry['text'])
-        seconds = int(self._now() - started) if started is not None else 0
+        seconds = int(ended - started) if started is not None else 0
         if ctx.call_id in self._over_time:
             reason = 'max_duration'
         elif ctx.call_id in self._canceled:
@@ -130,11 +178,11 @@ class MeetingLine:
         self._over_time.discard(ctx.call_id)
         await ctx.finish(reason, usage={'voiceSeconds': seconds}, handoff=handoff)
 
-    async def _await_handoff(self, meeting_id):
+    async def _await_handoff(self, meeting_id, owner):
         deadline = self._now() + self.handoff_timeout
         while self._now() < deadline:
             try:
-                handoff = await self.daemon.get_handoff(meeting_id)
+                handoff = await self.daemon.get_handoff(meeting_id, owner=owner)
             except Exception:
                 await self._sleep(self.poll_interval)
                 continue

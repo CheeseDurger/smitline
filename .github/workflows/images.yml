@@ -67,6 +67,8 @@ jobs:
           curl -fsS -o /dev/null http://127.0.0.1:8095/calls
           docker logs smitline-test
           docker rm -f smitline-test
+      - name: Owners over real HTTP (server mode, SMITLINE_REQUIRE_OWNER=1)
+        run: scripts/smoke-owners.sh smitline:test 18665
 
   publish:
     needs: test

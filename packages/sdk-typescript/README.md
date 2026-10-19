@@ -80,3 +80,17 @@ const client = new Smitline({
   readAuth: () => execFileSync('docker', ['exec', '-u', 'app', 'smitline', 'cat', '/data/.smitline/daemon.auth'], { encoding: 'utf8' }).trim(),
 });
 ```
+
+## Remote daemon
+
+A daemon on another host (server mode, or a hosted deployment) takes `baseUrl` and an API token. Every request sends that token and any extra `headers`; the SDK never starts a daemon or reads `daemon.auth`, and a `401` is an error at once:
+
+```js
+const client = new Smitline({
+  baseUrl: 'https://smitline.example.com',
+  token: process.env.SMITLINE_API_TOKEN,
+  // An internal API token may name the owner each request acts for (docs/calls.md#owners).
+  headers: { 'X-Smitline-Owner': 'acct_3f9c2a7b1d' },
+  autostart: false,
+});
+```

@@ -16,6 +16,9 @@ import threading
 
 TOKEN_PREFIX = 'cai_'
 FILE_NAME = 'api-tokens.json'
+# A standard token acts for its owner (or the local owner); an internal token, held by a
+# hosted gateway, may name the owner of each request with X-Smitline-Owner.
+TOKEN_KINDS = ('standard', 'internal')
 
 
 def _digest(token):
@@ -50,11 +53,20 @@ class ApiTokenStore:
             os.close(fd)
         os.replace(tmp, self.path)
 
-    def create(self, name):
+    def create(self, name, *, owner=None, kind='standard'):
+        from call_hooks import valid_owner
         name = str(name or '').strip()[:80] or 'unnamed'
+        if kind not in TOKEN_KINDS:
+            raise ValueError('kind must be standard or internal')
+        if owner is not None and not valid_owner(owner):
+            raise ValueError('owner must be lowercase letters, digits, _ and -, at most 64 characters')
         token = TOKEN_PREFIX + secrets.token_urlsafe(32)
         entry = {'id': 'tok-' + secrets.token_hex(6), 'name': name, 'createdAt': _now(),
                  'digest': _digest(token)}
+        if kind != 'standard':
+            entry['kind'] = kind
+        if owner is not None:
+            entry['owner'] = owner
         with self._lock:
             entries = self._read()
             entries.append(entry)
@@ -63,7 +75,11 @@ class ApiTokenStore:
 
     @staticmethod
     def public(entry):
-        return {'id': entry['id'], 'name': entry.get('name'), 'createdAt': entry.get('createdAt')}
+        public = {'id': entry['id'], 'name': entry.get('name'), 'createdAt': entry.get('createdAt'),
+                  'kind': entry.get('kind') if entry.get('kind') in TOKEN_KINDS else 'standard'}
+        if entry.get('owner'):
+            public['owner'] = entry['owner']
+        return public
 
     def list(self):
         return [self.public(entry) for entry in self._read()]
@@ -102,13 +118,20 @@ def main(argv=None):
     commands = parser.add_subparsers(dest='command', required=True)
     create = commands.add_parser('create', help='create a token and print it once')
     create.add_argument('--name', required=True)
+    create.add_argument('--owner', help='the owner id this token always acts for')
+    create.add_argument('--kind', choices=TOKEN_KINDS, default='standard',
+                        help='internal: may name the owner per request with X-Smitline-Owner')
     commands.add_parser('list', help='list tokens without their values')
     revoke = commands.add_parser('revoke', help='revoke a token by id')
     revoke.add_argument('id')
     args = parser.parse_args(argv)
     store = ApiTokenStore(default_path(Path(args.root).resolve()))
     if args.command == 'create':
-        token, entry = store.create(args.name)
+        try:
+            token, entry = store.create(args.name, owner=args.owner, kind=args.kind)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 2
         print(json.dumps({'token': token, **entry}, indent=2))
         print('Store this token now; it is not shown again.', file=sys.stderr)
     elif args.command == 'list':

@@ -535,3 +535,28 @@ class BridgeBackendTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+class BridgeNameTests(unittest.IsolatedAsyncioTestCase):
+    async def test_joinly_knows_the_name_the_bot_joined_under(self):
+        # Meet and Teams find the active speaker by skipping the bot's own tile, which they
+        # look up by JOINLY_NAME; another owner's meeting joins under that owner's name.
+        import json
+        import os
+        import tempfile
+        from pathlib import Path
+        import bridge
+        from joinly.settings import get_settings
+
+        class Stop(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp) / 'runtime.json'
+            state.write_text(json.dumps({'version': 1, 'meetingId': 'mtg-name00000001',
+                                         'meetingUrl': 'https://zoom.us/j/123456789',
+                                         'participantName': "Ana's assistant"}))
+            with patch.dict(os.environ, {'SMITLINE_RUNTIME_STATE': str(state)}), \
+                    patch.object(bridge, 'meeting_state_from_environ', side_effect=Stop):
+                with self.assertRaises(Stop):
+                    await bridge.main()
+                self.assertEqual(get_settings().name, "Ana's assistant")
