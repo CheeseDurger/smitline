@@ -1202,13 +1202,18 @@ class MeetingSettingsTests(unittest.IsolatedAsyncioTestCase):
                 seen.append(parse_env_file(Path(path).read_text()) if path else None)
                 await super().up(env)
         with tempfile.TemporaryDirectory() as temp:
+            from runtime_state import pool_claim_path
             runtime = Path(temp) / 'meeting-runtime'
             runtime.mkdir()
+            meeting = MeetingSession.from_dict(dict(session().to_dict(), owner=owner))
+            # Another owner's meeting runs in the meeting pool; the local owner's here runs in
+            # the one container at a time, which reads .env as before.
+            claim = None if owner == 'local' else {'path': pool_claim_path(temp, meeting.id),
+                                                   'record': {'owner': owner}}
             supervisor = ProductionMeetingSupervisor(
                 temp, runtime_root=runtime, launcher=Launcher(), health=FakeHealth(),
-                poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4,
+                poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4, claim=claim,
                 owner_environment=lambda name: meeting_environment(hooks, name)).bind_daemon(FakeDaemon())
-            meeting = MeetingSession.from_dict(dict(session().to_dict(), owner=owner))
             await supervisor.start(meeting)
             await supervisor.cancel(meeting.id)
             await supervisor.shutdown()

@@ -21,7 +21,9 @@ from meeting_line import meeting_environment
 from meeting_repository import MeetingRepository
 from meeting_supervisor import ProductionMeetingSupervisor
 from phone_gateway import create_gateway_app
+from runtime_config import RuntimeConfig
 from runtime_daemon import DaemonError, create_app
+from runtime_state import meeting_state_path, pool_claim_path, read_json
 from test_briefing import PROFILE
 from test_call_core import at, phone_brief, placed_at
 from test_call_service import DAYTIME, ZOOM, FakeLine, FakeSummarizer, RecordingNotifier, brief
@@ -510,12 +512,18 @@ class MeetingOwnerEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 await super().up(env)
         self.launcher = Launcher()
         hooks = DefaultCallHooks(environ={'OPENAI_API_KEY': 'sk-shared', 'SMITLINE_VOICE': 'cedar',
-                                          'SMITLINE_OWNER_NAME': "Ana O'Neil"})
-        self.supervisor = ProductionMeetingSupervisor(
-            root, runtime_root=self.runtime, launcher=self.launcher, health=FakeHealth(),
-            poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4,
-            owner_environment=lambda owner: meeting_environment(hooks, owner),
-        ).bind_daemon(FakeSupervisorDaemon())
+                                          'SMITLINE_OWNER_NAME': "Ana O'Neil",
+                                          'SMITLINE_PARTICIPANT_NAME': "Ana's assistant"})
+
+        def supervisor(claim=None):
+            return ProductionMeetingSupervisor(
+                root, runtime_root=self.runtime, launcher=self.launcher, health=FakeHealth(),
+                poll_interval=0.02, start_timeout=0.4, stop_timeout=0.4, claim=claim,
+                owner_environment=lambda owner: meeting_environment(hooks, owner),
+            ).bind_daemon(FakeSupervisorDaemon())
+        self.make_supervisor = supervisor
+        self.root = root
+        self.supervisor = supervisor()
 
     async def asyncTearDown(self):
         await self.supervisor.shutdown()
@@ -523,15 +531,24 @@ class MeetingOwnerEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_owner_meeting_gets_its_key_voice_and_name(self):
         meeting = MeetingSession.from_dict(dict(session().to_dict(), owner='acct_a'))
+        # Another owner's meeting runs in the pool: one container at a time refuses it.
+        await self.supervisor.shutdown()
+        self.supervisor = self.make_supervisor(claim={'path': pool_claim_path(self.root, meeting.id),
+                                                      'record': {'owner': 'acct_a'}})
         await self.supervisor.start(meeting)
         [(body, mode)] = self.seen
         self.assertEqual(mode, 0o600)
-        self.assertIn("OPENAI_API_KEY='sk-shared'\n", body)
-        self.assertIn("SMITLINE_VOICE='cedar'\n", body)
-        # A value compose could not read literally is blank rather than mangled, and never
-        # left to the shared .env, whose value is another owner's.
-        self.assertIn("SMITLINE_OWNER_NAME=''\n", body)
+        self.assertIn('OPENAI_API_KEY="sk-shared"\n', body)
+        self.assertIn('SMITLINE_VOICE="cedar"\n', body)
+        self.assertIn('SMITLINE_OWNER_NAME="Ana O\'Neil"\n', body)
         self.assertFalse(Path(self.launcher.ups[0]['SMITLINE_MEETING_ENV_FILE']).exists())
+        # The owner's participant name reaches the meeting's runtime state, which the
+        # container reads over its environment.
+        state = read_json(meeting_state_path(self.runtime, meeting.id))
+        self.assertEqual(state['participantName'], "Ana's assistant")
+        self.assertEqual(RuntimeConfig.from_environ({
+            'SMITLINE_RUNTIME_STATE': str(meeting_state_path(self.runtime, meeting.id))}).participant_name,
+            "Ana's assistant")
         await self.supervisor.cancel(meeting.id)
 
     async def test_the_local_owner_meeting_reads_the_shared_env(self):
@@ -539,7 +556,15 @@ class MeetingOwnerEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         await self.supervisor.start(meeting)
         self.assertNotIn('SMITLINE_MEETING_ENV_FILE', self.launcher.ups[0])
         self.assertEqual(self.seen, [])
+        state = read_json(meeting_state_path(self.runtime, meeting.id))
+        self.assertEqual(state['participantName'], 'Smitline')
         await self.supervisor.cancel(meeting.id)
+
+    def test_env_file_values_arrive_exactly(self):
+        from meeting_supervisor import owner_env_file
+        body = owner_env_file({'A': "O'Neil", 'B': 'say "hi" \\ $HOME', 'C': 'two\nlines', 'D': ''})
+        # A value compose cannot carry, or none, is blank: never the shared .env's value.
+        self.assertEqual(body, 'A="O\'Neil"\nB="say \\"hi\\" \\\\ \\$HOME"\nC=""\nD=""\n')
 
 
 if __name__ == '__main__':
