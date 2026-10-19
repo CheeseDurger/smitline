@@ -310,6 +310,8 @@ async def run_voice(speaker, microphone, page, api_key, runtime, adapter, meetin
 async def main():
     global record, presence
     runtime = RuntimeConfig.from_environ()
+    # Meet and Teams find the active speaker by skipping the bot's own tile, by this name.
+    os.environ['JOINLY_NAME'] = runtime.participant_name
     meeting_state = meeting_state_from_environ()
     state['participant_name'] = runtime.participant_name
     state['meeting_guidance_configured'] = bool(runtime.meeting_instructions)

@@ -10,6 +10,7 @@
   "security": [{ "bearer": [] }],
   "paths": {
     "/v1/calls/check": {
+      "parameters": [{ "$ref": "#/components/parameters/Owner" }],
       "post": {
         "summary": "Validate a brief without starting a call",
         "operationId": "checkCall",
@@ -21,14 +22,18 @@
       }
     },
     "/v1/calls": {
+      "parameters": [{ "$ref": "#/components/parameters/Owner" }],
       "post": {
         "summary": "Start a call",
         "operationId": "startCall",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Brief" } } } },
         "responses": {
           "201": { "description": "Call accepted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Call" } } } },
-          "403": { "$ref": "#/components/responses/Error" },
+          "402": { "$ref": "#/components/responses/Refused" },
+          "403": { "$ref": "#/components/responses/Refused" },
+          "409": { "$ref": "#/components/responses/Refused" },
           "422": { "$ref": "#/components/responses/BriefProblem" },
+          "429": { "$ref": "#/components/responses/Refused" },
           "503": { "$ref": "#/components/responses/Error" }
         }
       },
@@ -48,7 +53,7 @@
       }
     },
     "/v1/calls/{callId}": {
-      "parameters": [{ "$ref": "#/components/parameters/CallId" }],
+      "parameters": [{ "$ref": "#/components/parameters/CallId" }, { "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "Get a call",
         "operationId": "getCall",
@@ -59,7 +64,7 @@
       }
     },
     "/v1/calls/{callId}/wait": {
-      "parameters": [{ "$ref": "#/components/parameters/CallId" }],
+      "parameters": [{ "$ref": "#/components/parameters/CallId" }, { "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "Wait until the call finishes or the timeout passes",
         "operationId": "waitForCall",
@@ -71,7 +76,7 @@
       }
     },
     "/v1/calls/{callId}/events": {
-      "parameters": [{ "$ref": "#/components/parameters/CallId" }],
+      "parameters": [{ "$ref": "#/components/parameters/CallId" }, { "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "Stream call events (server-sent events, resumable with Last-Event-ID)",
         "operationId": "streamCallEvents",
@@ -79,7 +84,7 @@
       }
     },
     "/v1/calls/{callId}/instructions": {
-      "parameters": [{ "$ref": "#/components/parameters/CallId" }],
+      "parameters": [{ "$ref": "#/components/parameters/CallId" }, { "$ref": "#/components/parameters/Owner" }],
       "post": {
         "summary": "Add guidance to a call in progress",
         "operationId": "instructCall",
@@ -91,7 +96,7 @@
       }
     },
     "/v1/calls/{callId}/end": {
-      "parameters": [{ "$ref": "#/components/parameters/CallId" }],
+      "parameters": [{ "$ref": "#/components/parameters/CallId" }, { "$ref": "#/components/parameters/Owner" }],
       "post": {
         "summary": "End the call politely and build the result",
         "operationId": "endCall",
@@ -99,7 +104,7 @@
       }
     },
     "/v1/calls/{callId}/transfer": {
-      "parameters": [{ "$ref": "#/components/parameters/CallId" }],
+      "parameters": [{ "$ref": "#/components/parameters/CallId" }, { "$ref": "#/components/parameters/Owner" }],
       "post": {
         "summary": "Hand a connected phone call to the owner's phone",
         "operationId": "transferCall",
@@ -110,6 +115,7 @@
       }
     },
     "/v1/calls/{callId}/recording": {
+      "parameters": [{ "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "Download a recorded call from the phone provider. WAV keeps both sides on separate channels; MP3 mixes them into one.",
         "operationId": "getCallRecording",
@@ -126,6 +132,7 @@
       }
     },
     "/v1/calls/{callId}/note": {
+      "parameters": [{ "$ref": "#/components/parameters/Owner" }],
       "post": {
         "summary": "Save a note on a finished call for later calls to start with",
         "operationId": "saveCallNote",
@@ -140,6 +147,7 @@
       }
     },
     "/v1/contacts": {
+      "parameters": [{ "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "List every number called or calling, with what the user saved about it, latest call first",
         "operationId": "listContacts",
@@ -150,7 +158,7 @@
       }
     },
     "/v1/contacts/{number}": {
-      "parameters": [{ "name": "number", "in": "path", "required": true, "description": "E.164, with + encoded as %2B", "schema": { "type": "string" } }],
+      "parameters": [{ "name": "number", "in": "path", "required": true, "description": "E.164, with + encoded as %2B", "schema": { "type": "string" } }, { "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "One contact, its calls, and the notes a new call to it would start with",
         "operationId": "getContact",
@@ -179,6 +187,7 @@
       }
     },
     "/v1/voices": {
+      "parameters": [{ "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "List GPT-Live voices",
         "operationId": "listVoices",
@@ -186,6 +195,7 @@
       }
     },
     "/v1/profile": {
+      "parameters": [{ "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "Get the owner's profile, which every phone call gets as background",
         "operationId": "getProfile",
@@ -206,6 +216,7 @@
       }
     },
     "/v1/do-not-call": {
+      "parameters": [{ "$ref": "#/components/parameters/Owner" }],
       "get": {
         "summary": "List the numbers Smitline refuses to call because the person asked not to be called again",
         "operationId": "getDoNotCall",
@@ -228,14 +239,16 @@
   },
   "components": {
     "securitySchemes": {
-      "bearer": { "type": "http", "scheme": "bearer", "description": "The per-launch token in .smitline/daemon.auth, or an API token in server mode." }
+      "bearer": { "type": "http", "scheme": "bearer", "description": "The per-launch token in .smitline/daemon.auth, or an API token in server mode. A token created with an owner acts as that owner. With SMITLINE_REQUIRE_OWNER=1, a request that would act as the local owner is refused with 401 owner_required. See docs/calls.md#owners." }
     },
     "parameters": {
-      "CallId": { "name": "callId", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^call-[0-9a-f]{16}$" } }
+      "CallId": { "name": "callId", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^call-[0-9a-f]{16}$" } },
+      "Owner": { "name": "X-Smitline-Owner", "in": "header", "required": false, "description": "The owner this request acts for. Only an internal API token may send it (otherwise 403 owner_header_forbidden); a value that is not an owner id is 400 invalid_owner.", "schema": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" } }
     },
     "responses": {
       "Error": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "BriefProblem": { "description": "The brief is invalid or incomplete", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+      "BriefProblem": { "description": "The brief is invalid or incomplete", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Refused": { "description": "Refused by the guardrails, by the installation (409 capacity_exceeded or owner_capacity_exceeded when no meeting container can take the meeting now; 409 meeting_pool_required: a meeting for an owner other than local needs SMITLINE_MAX_MEETINGS of 2 or more), or by the deployment's hooks, with details beside code and message where they help: a hosted deployment answers 402 (insufficient_credit with balance, affordableMinutes and topUpUrl; payment_required), 403 (verification_required with verifyUrl, spending_cap_reached, destination_not_allowed) or 429 (too_many_active_calls).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
     },
     "schemas": {
       "Brief": {
@@ -441,10 +454,10 @@
         "required": ["id", "channel", "status", "brief", "createdAt"],
         "properties": {
           "id": { "type": "string" },
-          "owner": { "type": "string" },
+          "owner": { "type": "string", "description": "The owner the call belongs to; local on a self-hosted installation." },
           "channel": { "type": "string", "enum": ["phone", "meeting"] },
           "status": { "type": "string", "enum": ["queued", "connecting", "ringing", "waiting", "in_progress", "summarizing", "completed", "failed", "canceled"] },
-          "endReason": { "type": "string", "enum": ["hangup", "remote_hangup", "no_answer", "busy", "voicemail", "max_duration", "canceled", "meeting_ended", "transferred", "error"] },
+          "endReason": { "type": "string", "enum": ["hangup", "remote_hangup", "no_answer", "busy", "voicemail", "max_duration", "canceled", "meeting_ended", "transferred", "error", "refused"] },
           "brief": { "$ref": "#/components/schemas/Brief" },
           "createdAt": { "type": "string", "format": "date-time" },
           "updatedAt": { "type": "string", "format": "date-time" },
@@ -529,6 +542,8 @@
           "error": {
             "type": "object",
             "required": ["code", "message"],
+            "description": "A refusal may carry details beside code and message, such as balance or topUpUrl.",
+            "additionalProperties": true,
             "properties": {
               "code": { "type": "string" },
               "message": { "type": "string" },

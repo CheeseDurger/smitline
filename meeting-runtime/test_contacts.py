@@ -131,7 +131,7 @@ class CarriedContextTests(unittest.IsolatedAsyncioTestCase):
         stored = self.h.store.get(record['id'])
         self.assertEqual(stored['carried'], carried)
         self.assertNotIn('carried', stored['brief'])
-        await self.h.service.wait(record['id'], timeout=5)
+        await self.h.service.wait(record['id'], timeout=5, owner='local')
         ctx = self.h.line.contexts[record['id']]
         self.assertEqual(ctx.brief.session_context['earlierCalls'], [note_line(item) for item in carried])
 
@@ -139,7 +139,7 @@ class CarriedContextTests(unittest.IsolatedAsyncioTestCase):
         finished(self.h, to='+14155550199', day=1, note='Booked the cleaning.')
         record, _ = await self.start()
         self.assertNotIn('carried', record)
-        self.h.hooks.contact_book.update('+14155550199', {'autoContext': True})
+        self.h.hooks.contact_book('local').update('+14155550199', {'autoContext': True})
         record, _ = await self.start()
         self.assertEqual([item['text'] for item in record['carried']], ['Booked the cleaning.'])
         # The brief can still say no for one call.
@@ -161,7 +161,7 @@ class CarriedContextTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_incoming_calls_never_start_with_earlier_calls(self):
         finished(self.h, to='+14155550199', day=1, note='Booked the cleaning.')
-        self.h.hooks.contact_book.update('+14155550199', {'autoContext': True})
+        self.h.hooks.contact_book('local').update('+14155550199', {'autoContext': True})
         record = await self.h.service.create_inbound(CallBrief.from_dict(brief(to='+14155550199')),
                                                      'local', self.h.line.start)
         self.assertNotIn('carried', record)
@@ -169,22 +169,22 @@ class CarriedContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_notes_are_saved_on_finished_calls_only(self):
         record, _ = await self.start()
         with self.assertRaises(CallError) as caught:
-            self.h.service.save_note(record['id'], 'Too early.')
+            self.h.service.save_note(record['id'], 'Too early.', owner='local')
         self.assertEqual(caught.exception.status, 409)
-        await self.h.service.wait(record['id'], timeout=5)
-        saved = self.h.service.save_note(record['id'], '  Booked  for 7pm.  ')
+        await self.h.service.wait(record['id'], timeout=5, owner='local')
+        saved = self.h.service.save_note(record['id'], '  Booked  for 7pm.  ', owner='local')
         self.assertEqual(saved['carryNote']['text'], 'Booked for 7pm.')
         self.assertEqual(saved['carryNote']['by'], 'agent')
         for text in ('', 'x' * 1201, 42):
             with self.subTest(text=text), self.assertRaises(CallError):
-                self.h.service.save_note(record['id'], text)
+                self.h.service.save_note(record['id'], text, owner='local')
 
     async def test_contacts_group_calls_by_number(self):
         finished(self.h, to='+14155550101', day=1, contact={'name': 'Apex Roofing'})
         finished(self.h, to='+14155550101', day=3, direction='inbound', summary='They called back.')
         finished(self.h, to='+14155550102', day=2)
         finished(self.h, to='https://us05web.zoom.us/j/123456789', channel='meeting', day=4)
-        self.h.hooks.contact_book.update('+14155550103', {'name': 'Never called', 'notes': 'New plumber.'})
+        self.h.hooks.contact_book('local').update('+14155550103', {'name': 'Never called', 'notes': 'New plumber.'})
         listed = self.h.service.contacts('local')['contacts']
         self.assertEqual([(item['number'], item['calls']) for item in listed],
                          [('+14155550101', 2), ('+14155550102', 1), ('+14155550103', 0)])

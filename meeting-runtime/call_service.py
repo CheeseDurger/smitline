@@ -5,7 +5,9 @@ import os
 
 from call_brief import BriefIncomplete, CallBrief
 from call_costs import call_cost, spend, with_cost
-from call_hooks import CallRefused, LineNotReady, MissingCredentials, maybe_await
+from call_hooks import (
+    LOCAL_OWNER, CallRefused, LineNotReady, MissingCredentials, maybe_await, owner_settings,
+)
 from call_result import (
     DEFAULT_SUMMARY_MODEL, ResponsesSummarizer, SummaryUnavailable, fallback_result,
     result_from_handoff, result_without_conversation, transcript_entries,
@@ -27,6 +29,9 @@ STATUS_RANK = {
     'queued': 0, 'connecting': 1, 'ringing': 2, 'waiting': 2, 'in_progress': 3,
     'summarizing': 4, 'completed': 5, 'failed': 5, 'canceled': 5,
 }
+# Seconds a stop gives calls in progress to end (a phone call hangs up) and report what they
+# used before what is left is cut off (SMITLINE_SHUTDOWN_GRACE).
+SHUTDOWN_GRACE = 5.0
 # Notes for later calls: one note's length, and what one call may start with.
 MAX_NOTE = 1200
 MAX_CARRIED = 10
@@ -57,6 +62,10 @@ class CallContext:
 
     def credentials(self, provider):
         return self.service.hooks.credentials(self.owner, provider)
+
+    def settings(self):
+        """The owner's settings (name, phone, voice, recording), not the installation's."""
+        return owner_settings(self.service.hooks, self.owner)
 
     def profile(self):
         """The owner's profile (level-1 context); empty when the hooks keep none."""
@@ -120,7 +129,7 @@ def note_line(item):
 
 class CallService:
     def __init__(self, store, *, hooks, lines, summarizer_factory=None, environ=None,
-                 price_check_delays=PRICE_CHECK_DELAYS):
+                 price_check_delays=PRICE_CHECK_DELAYS, shutdown_grace=SHUTDOWN_GRACE):
         self.store = store
         self.price_check_delays = tuple(price_check_delays)
         self._price_checked = set()
@@ -128,9 +137,14 @@ class CallService:
         self.lines = dict(lines or {})
         self._environ = environ
         self._summarizer_factory = summarizer_factory or self._default_summarizer
+        self.shutdown_grace = shutdown_grace
         self._contexts = {}
         self._tasks = set()
+        self._call_tasks = {}  # call id -> the task running it on its line
         self._changed = {}
+        # Calls closed before they could finish (a stop, a restart): their usage is still
+        # recorded, once each, so a hosted deployment settles what call_started held.
+        self._unsettled = []
 
     @property
     def environ(self):
@@ -174,6 +188,16 @@ class CallService:
 
     # Public operations ---------------------------------------------------
 
+    async def owner_for(self, request):
+        """The owner a request acts for; a refusal (no owner, a bad one) becomes a CallError."""
+        try:
+            return await maybe_await(self.hooks.owner_for(request))
+        except CallRefused as error:
+            raise CallError(error.status, error.code, error.message, **error.details) from error
+
+    def settings(self, owner):
+        return owner_settings(self.hooks, owner)
+
     def _brief(self, owner, payload):
         """Parse a brief after filling in what setup already knows (the owner's name, phone)."""
         if isinstance(payload, dict):
@@ -181,11 +205,11 @@ class CallService:
             filled = dict(defaults(owner, payload) or {}) if defaults else {}
             filled.update({key: value for key, value in payload.items() if value not in (None, '')})
             payload = filled
-        return CallBrief.from_dict(payload, environ=self.environ)
+        return CallBrief.from_dict(payload, environ=self.settings(owner))
 
     async def check(self, payload, *, request=None):
         """Everything create() would refuse, reported instead of raised."""
-        owner = await maybe_await(self.hooks.owner_for(request))
+        owner = await self.owner_for(request)
         brief = self._brief(owner, payload)
         line = self.lines.get(brief.channel)
         problems = []
@@ -209,17 +233,24 @@ class CallService:
         return {'ok': not problems, 'brief': brief.to_dict(), 'problems': problems, 'carried': carried}
 
     def reconcile(self):
-        """At startup, close calls a previous daemon left unfinished; nothing will finish them."""
+        """At startup, close calls a previous daemon left unfinished; nothing will finish them.
+        Their usage is recorded as for any finished call."""
         closed = []
         for record in self.store.list(limit=1000):
             if record['status'] in TERMINAL or record['id'] in self._contexts:
                 continue
             self._close_unfinished(record['id'], 'The daemon stopped before the call finished.')
             closed.append(record['id'])
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return closed  # No event loop yet: shutdown records them.
+        if closed:
+            self._spawn(self._settle_unfinished(), name='settle-unfinished-calls')
         return closed
 
     async def create(self, payload, *, request=None):
-        owner = await maybe_await(self.hooks.owner_for(request))
+        owner = await self.owner_for(request)
         brief = self._brief(owner, payload)
         line = self.lines.get(brief.channel)
         if line is None:
@@ -229,7 +260,7 @@ class CallService:
             await maybe_await(self.hooks.precheck(owner, brief))
             line.ready(self.hooks, owner, brief)
         except CallRefused as error:
-            raise CallError(403, error.code, error.message) from error
+            raise CallError(error.status, error.code, error.message, **error.details) from error
         except MissingCredentials as error:
             raise CallError(503, 'not_configured', str(error),
                             provider=error.provider, missing=list(error.missing)) from error
@@ -237,13 +268,13 @@ class CallService:
         carried = self._carried(owner, brief)
         if carried:
             brief = dataclasses.replace(brief, carried=tuple(note_line(item) for item in carried))
-        return self._launch(brief, owner, line.start, direction='outbound', carried=carried)
+        return await self._launch(brief, owner, line.start, direction='outbound', carried=carried)
 
     async def create_inbound(self, brief, owner, start):
         """Record a call someone else placed to us; `start(ctx)` runs it on the line."""
-        return self._launch(brief, owner, start, direction='inbound')
+        return await self._launch(brief, owner, start, direction='inbound')
 
-    def _launch(self, brief, owner, start, *, direction, carried=()):
+    async def _launch(self, brief, owner, start, *, direction, carried=()):
         now = self.store.now()
         record = {
             'version': 1,
@@ -264,10 +295,36 @@ class CallService:
             record['carried'] = list(carried)
         self.store.create(record)
         self._event(record['id'], 'call.created', channel=brief.channel, direction=direction)
+        await self._call_started(owner, record)
         context = CallContext(self, record['id'], brief, owner)
         self._contexts[record['id']] = context
-        self._spawn(self._run(start, context), name='call-' + record['id'])
+        task = self._spawn(self._run(start, context), name='call-' + record['id'])
+        self._call_tasks[record['id']] = task
+        task.add_done_callback(lambda _done, call_id=record['id']: self._call_tasks.pop(call_id, None))
         return record
+
+    async def _call_started(self, owner, record):
+        """Tell the hooks a call is about to start (a hosted service places a balance hold).
+
+        A refusal, or any failure, ends the call before its line starts, so no record is left
+        waiting for a line that never ran.
+        """
+        started = getattr(self.hooks, 'call_started', None)
+        if started is None:
+            return
+        try:
+            await maybe_await(started(owner, record))
+        except CallRefused as error:
+            self._refuse(record['id'], error.code, error.message)
+            raise CallError(error.status, error.code, error.message, **error.details) from error
+        except Exception as error:
+            self._event(record['id'], 'call.started_hook_failed', error=type(error).__name__)
+            self._refuse(record['id'], 'call_start_failed', 'The call could not be started.')
+            raise CallError(503, 'call_start_failed', 'The call could not be started.') from error
+
+    def _refuse(self, call_id, code, message):
+        self.store.update(call_id, error=message)
+        self._set_status(call_id, 'failed', endReason='refused', detail=code)
 
     def _spawn(self, coroutine, name=None):
         task = asyncio.create_task(coroutine, name=name)
@@ -288,15 +345,19 @@ class CallService:
         except Exception as error:
             await context.finish('error', error=f'{type(error).__name__}: {str(error)[:200]}')
 
-    def active_count(self, *, direction=None):
+    def active_count(self, *, direction=None, owner=None):
+        """Calls in progress, of one direction and one owner when given."""
         count = 0
         for call_id in list(self._contexts):
             try:
                 record = self.store.get(call_id)
             except CallNotFound:
                 continue
-            if direction is None or record.get('direction') == direction:
-                count += 1
+            if direction is not None and record.get('direction') != direction:
+                continue
+            if owner is not None and record.get('owner') != owner:
+                continue
+            count += 1
         return count
 
     def attach_recording(self, call_id, *, sid, url, seconds=None):
@@ -309,7 +370,7 @@ class CallService:
         self.store.update(call_id, recording=recording)
         self._event(call_id, 'call.recording', **recording)
 
-    async def recording(self, call_id, *, owner=None, fmt='wav'):
+    async def recording(self, call_id, *, owner, fmt='wav'):
         """A recorded call's audio from the phone provider, as (bytes, content type)."""
         if fmt not in ('wav', 'mp3'):
             raise CallError(422, 'invalid_request', 'format must be wav or mp3')
@@ -370,16 +431,24 @@ class CallService:
 
     # Contacts, tasks, and notes for later calls ------------------------------
 
-    def _contact_book(self):
+    def _owner_contact_book(self, owner):
+        """hooks.contact_book(owner); hooks written before owners keep one book attribute,
+        which is the local owner's: another owner has none."""
         book = getattr(self.hooks, 'contact_book', None)
+        if callable(book):
+            return book(owner)
+        return book if owner == LOCAL_OWNER else None
+
+    def _contact_book(self, owner):
+        book = self._owner_contact_book(owner)
         if book is None:
             raise CallError(501, 'unsupported', 'these call hooks keep no contacts')
         return book
 
-    def _saved_contacts(self):
+    def _saved_contacts(self, owner):
         """{number: what the user saved}; empty when the hooks keep no contacts."""
         from contacts import ContactsUnreadable
-        book = getattr(self.hooks, 'contact_book', None)
+        book = self._owner_contact_book(owner)
         if book is None:
             return {}
         try:
@@ -440,7 +509,7 @@ class CallService:
         when the user switched on the contact's autoContext and the brief does not say false.
         """
         wanted = brief.carry_from or {}
-        saved = self._saved_contacts() if brief.channel == 'phone' else {}
+        saved = self._saved_contacts(owner) if brief.channel == 'phone' else {}
         automatic = bool((saved.get(brief.to) or {}).get('autoContext'))
         by_contact = brief.channel == 'phone' and wanted.get('contact', automatic)
         by_task = bool(wanted.get('task') and brief.task)
@@ -467,7 +536,7 @@ class CallService:
                 by_number.setdefault((record.get('brief') or {}).get('to'), []).append(record)
         return self._notes(chosen, saved, self._profile_or_empty(owner), by_number)
 
-    def save_note(self, call_id, text, *, owner=None):
+    def save_note(self, call_id, text, *, owner):
         """Save a note on a finished call for later calls to start with."""
         record = self.get(call_id, owner=owner)
         if record['status'] not in TERMINAL:
@@ -498,7 +567,7 @@ class CallService:
 
     def contacts(self, owner):
         """Every number called or calling, with what the user saved about it, latest call first."""
-        saved = self._saved_contacts()
+        saved = self._saved_contacts(owner)
         profile = self._profile_or_empty(owner)
         by_number = {}
         for record in self._phone_records(owner):
@@ -515,7 +584,7 @@ class CallService:
             number = normalize_phone(number, 'number')
         except ValueError as error:
             raise CallError(422, 'invalid_request', str(error)) from error
-        saved = self._saved_contacts()
+        saved = self._saved_contacts(owner)
         profile = self._profile_or_empty(owner)
         records = [record for record in self._phone_records(owner) if record['brief']['to'] == number]
         if not records and number not in saved:
@@ -534,7 +603,7 @@ class CallService:
     def update_contact(self, owner, number, changes):
         from contacts import ContactsUnreadable
         try:
-            self._contact_book().update(number, changes)
+            self._contact_book(owner).update(number, changes)
         except ContactsUnreadable as error:
             raise CallError(503, 'contacts_unreadable', str(error)) from error
         except ValueError as error:
@@ -545,7 +614,7 @@ class CallService:
         """Drop the saved name, notes, and setting. Call records, and their notes, stay."""
         from contacts import ContactsUnreadable
         try:
-            forgotten = self._contact_book().forget(number)
+            forgotten = self._contact_book(owner).forget(number)
         except ContactsUnreadable as error:
             raise CallError(503, 'contacts_unreadable', str(error)) from error
         except ValueError as error:
@@ -571,14 +640,17 @@ class CallService:
             return
         self._event(record['id'], 'call.do_not_call', number=brief['to'])
 
-    def get(self, call_id, *, owner=None):
+    def get(self, call_id, *, owner):
+        """One of the owner's calls; another owner's call is not found."""
         record = self.store.get(call_id)
-        if owner is not None and record.get('owner') != owner:
+        if record.get('owner') != owner:
             raise CallNotFound(call_id)
         return with_cost(record, self.environ)
 
-    def list(self, *, owner=None, limit=20):
-        """Newest first; limit=None lists every call."""
+    def list(self, *, owner, limit=20):
+        """The owner's calls, newest first; limit=None lists every call."""
+        if owner is None:
+            raise ValueError('owner is required')
         return [with_cost(record, self.environ)
                 for record in self.store.list(owner=owner, limit=limit)]
 
@@ -640,7 +712,7 @@ class CallService:
     def events(self, call_id, *, after=None):
         return self.store.events(call_id, after=after)
 
-    async def wait(self, call_id, *, timeout=60, owner=None):
+    async def wait(self, call_id, *, owner, timeout=60):
         timeout = max(0.0, min(float(timeout), MAX_WAIT_SECONDS))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -662,7 +734,7 @@ class CallService:
         except asyncio.TimeoutError:
             pass
 
-    async def instruct(self, call_id, text, *, owner=None, silent=False):
+    async def instruct(self, call_id, text, *, owner, silent=False):
         record = self.get(call_id, owner=owner)
         if record['status'] in TERMINAL or record['status'] == 'summarizing':
             raise CallError(409, 'conflict', 'the call has already ended')
@@ -677,7 +749,7 @@ class CallService:
                     silent=bool(silent))
         return {'delivered': bool(delivered)}
 
-    async def end(self, call_id, *, owner=None):
+    async def end(self, call_id, *, owner):
         record = self.get(call_id, owner=owner)
         if record['status'] in TERMINAL:
             return record
@@ -688,7 +760,7 @@ class CallService:
             await context.finish('canceled')
         return self.store.get(call_id)
 
-    async def transfer(self, call_id, *, owner=None):
+    async def transfer(self, call_id, *, owner):
         record = self.get(call_id, owner=owner)
         if record['status'] != 'in_progress':
             raise CallError(409, 'conflict', 'only a connected call can be transferred')
@@ -745,7 +817,9 @@ class CallService:
             self._set_status(call_id, 'failed', endReason='error', error=error, usage=usage,
                              cost=call_cost(dict(record, usage=usage), self.environ))
         else:
-            self._set_status(call_id, 'summarizing', endReason=end_reason)
+            # The line's usage is kept now, so a stop while the result is written loses none.
+            self._set_status(call_id, 'summarizing', endReason=end_reason, usage=usage,
+                             cost=call_cost(dict(record, usage=usage), self.environ))
             try:
                 result = await self._build_result(context, end_reason, usage, handoff)
             except asyncio.CancelledError:
@@ -771,10 +845,7 @@ class CallService:
         if self._needs_price(record):
             self._price_checked.add(call_id)
             self._spawn(self._settle_price(call_id))
-        try:
-            await maybe_await(self.hooks.record_usage(record['owner'], record, record.get('usage') or {}))
-        except Exception:
-            self._event(call_id, 'call.usage_failed')
+        await self._record_usage(record)
         try:
             delivery = await self.hooks.notify(record['owner'], record)
         except Exception as notify_error:
@@ -782,13 +853,36 @@ class CallService:
         if delivery is not None:
             self._event(call_id, 'call.webhook', **delivery)
 
+    async def _record_usage(self, record):
+        """Tell the hooks what a finished call used, with the call's owner."""
+        try:
+            await maybe_await(self.hooks.record_usage(record['owner'], record, record.get('usage') or {}))
+        except Exception:
+            self._event(record['id'], 'call.usage_failed')
+
+    async def _settle_unfinished(self):
+        """Record the usage of calls closed before they could finish, once each, with what is
+        known of them (the line's usage when it got that far)."""
+        while self._unsettled:
+            call_id = self._unsettled.pop(0)
+            try:
+                record = self.store.get(call_id)
+            except CallNotFound:
+                continue
+            await self._record_usage(record)
+
     async def shutdown(self):
         active = list(self._contexts)
         for call_id in active:
             try:
-                await self.end(call_id)
+                await self.end(call_id, owner=self.store.get(call_id).get('owner'))
             except Exception:
                 pass
+        # Each line was asked to end its call (a phone call hangs up). Give them a moment to
+        # do so and report what the call used, then cut off what is left.
+        running = [task for task in map(self._call_tasks.get, active) if task is not None]
+        if running and self.shutdown_grace > 0:
+            await asyncio.wait(running, timeout=self.shutdown_grace)
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:
@@ -797,12 +891,15 @@ class CallService:
             if self.store.get(call_id)['status'] not in TERMINAL:
                 self._close_unfinished(call_id, 'The daemon stopped before the call finished.')
         self._contexts.clear()
+        await self._settle_unfinished()
 
     def _close_unfinished(self, call_id, message):
-        """Mark a call that can no longer finish as failed, keeping what was said."""
+        """Mark a call that can no longer finish as failed, keeping what was said; its usage
+        is recorded by _settle_unfinished."""
         transcript = [{'speaker': e['data'].get('speaker'), 'text': e['data'].get('text')}
                       for e in self.store.events(call_id) if e['type'] == 'call.transcript']
         result = fallback_result('error', transcript, 0, message.rstrip('.').lower())
         result['outcome'] = 'failed'
         self.store.update(call_id, result=result, error=message)
         self._set_status(call_id, 'failed', endReason='error')
+        self._unsettled.append(call_id)

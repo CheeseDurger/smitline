@@ -23,8 +23,7 @@ def register_call_routes(app, service, *, read_json, public_json, sse_poll_inter
                          sse_heartbeat_interval=15.0):
 
     async def owner(request):
-        from call_hooks import maybe_await
-        return await maybe_await(service.hooks.owner_for(request))
+        return await service.owner_for(request)
 
     def handle(handler):
         async def wrapped(request):
@@ -125,7 +124,8 @@ def register_call_routes(app, service, *, read_json, public_json, sse_poll_inter
     @handle
     async def call_events(request):
         call_id = request.match_info['callId']
-        service.get(call_id, owner=await owner(request))
+        call_owner = await owner(request)
+        service.get(call_id, owner=call_owner)
         if request.query.get('format') == 'json':
             # Polling clients (the local console) read a page of events after a cursor.
             events = service.events(call_id, after=request.query.get('after'))
@@ -146,7 +146,8 @@ def register_call_routes(app, service, *, read_json, public_json, sse_poll_inter
                              f'data: {json.dumps(event, ensure_ascii=False)}\n\n')
                     await response.write(chunk.encode('utf-8'))
                     after = event['id']
-                if service.get(call_id)['status'] in TERMINAL and not service.events(call_id, after=after):
+                if service.get(call_id, owner=call_owner)['status'] in TERMINAL \
+                        and not service.events(call_id, after=after):
                     break
                 if loop.time() - last_heartbeat >= sse_heartbeat_interval:
                     await response.write(b': heartbeat\n\n')
@@ -214,9 +215,10 @@ def register_call_routes(app, service, *, read_json, public_json, sse_poll_inter
         payload = await read_json(request)
         return public_json(service.update_do_not_call(await owner(request), payload))
 
-    async def list_voices(_request):
+    @handle
+    async def list_voices(request):
         from call_brief import default_voice
-        env = service.environ
+        env = service.settings(await owner(request))
         return public_json({'default': default_voice(env), 'voices': list(available_voices(env))})
 
     async def openapi(_request):

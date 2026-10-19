@@ -188,7 +188,7 @@ class PriceLookupTests(unittest.IsolatedAsyncioTestCase):
         service = self.service(line)
         self.stored('call-00000000000000a1')
         self.stored('call-00000000000000a2', phonePrice={'amount': 0.01, 'currency': 'USD'})
-        records = service.list(limit=None)
+        records = service.list(owner='local', limit=None)
         service.backfill_prices(records)
         service.backfill_prices(records)
         await asyncio.gather(*service._tasks)
@@ -199,7 +199,7 @@ class PriceLookupTests(unittest.IsolatedAsyncioTestCase):
         service = self.service(PricingLine([]))
         record = dict(phone_record(voiceSeconds=60), id='call-00000000000000b1')
         self.store.create(record)
-        self.assertEqual(service.list(limit=None)[0]['cost']['openai'], 0.05)
+        self.assertEqual(service.list(owner='local', limit=None)[0]['cost']['openai'], 0.05)
         self.assertNotIn('cost', self.store.get('call-00000000000000b1'))
 
 

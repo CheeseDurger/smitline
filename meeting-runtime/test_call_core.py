@@ -467,6 +467,28 @@ class GuardrailTests(unittest.TestCase):
         DefaultCallHooks(environ={'SMITLINE_MAX_CALLS_PER_HOUR': '25'}, store=busy,
                          clock=at(18)).precheck('local', CallBrief.from_dict(phone_brief()))
 
+    def test_calls_that_never_reached_the_phone_do_not_count(self):
+        now = at(18)()
+        number = '+14155550142'
+        limits = {'SMITLINE_MAX_CALLS_PER_NUMBER': '1', 'SMITLINE_MAX_CALLS_PER_HOUR': '1'}
+        # Refused when it started (no credit), failed before the provider placed it, canceled
+        # before it was dialed: nobody's phone rang.
+        never = [dict(placed_at(number, 10, now), status='failed', endReason='refused', line={}),
+                 dict(placed_at(number, 20, now), status='failed', endReason='error', line={}),
+                 dict(placed_at(number, 30, now), status='canceled', endReason='canceled', line={})]
+        DefaultCallHooks(environ=dict(limits), store=FakeCalls(never), clock=at(18)).precheck(
+            'local', CallBrief.from_dict(phone_brief()))
+        # A call the provider placed counts, however it ended, and so does one still being placed.
+        for counted in (dict(placed_at(number, 40, now), status='failed', endReason='error',
+                             line={'providerCallSid': 'CA1'}),
+                        dict(placed_at(number, 40, now), status='completed', line={'liveSessionId': 'rtc_1'}),
+                        dict(placed_at(number, 1, now), status='queued', line={})):
+            with self.subTest(record=counted):
+                refused = self.refused(DefaultCallHooks(environ=dict(limits), store=FakeCalls(never + [counted]),
+                                                        clock=at(18)))
+                self.assertEqual(refused.code, 'too_many_calls_to_number')
+                self.assertIn('called +14155550142 1 times', refused.message)
+
     def test_record_is_a_phone_only_flag(self):
         self.assertTrue(CallBrief.from_dict(phone_brief(record=True)).to_dict()['record'])
         self.assertNotIn('record', CallBrief.from_dict(phone_brief()).to_dict())

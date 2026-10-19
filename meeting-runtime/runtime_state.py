@@ -14,6 +14,8 @@ MEETINGS_DIR = 'meetings'
 CONTROL_DIR = '.smitline'
 DAEMON_DATA_NAME = 'daemon-data'
 PORTAL_ACTIVE_NAME = 'portal-active.json'
+# With several meetings at once, each running meeting's claim is its own file here.
+POOL_ACTIVE_DIR = 'active-meetings'
 
 
 def ensure_private_dir(path):
@@ -72,6 +74,10 @@ def meeting_state_path(root, meeting_id):
 
 def active_meeting_path(project_root):
     return control_root(project_root) / ACTIVE_NAME
+
+
+def pool_claim_path(project_root, meeting_id):
+    return control_root(project_root) / POOL_ACTIVE_DIR / (require_meeting_id(meeting_id) + '.json')
 
 
 def daemon_token_path(project_root):

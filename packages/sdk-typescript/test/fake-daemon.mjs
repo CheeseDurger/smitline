@@ -56,7 +56,8 @@ export async function startFakeDaemon(options = {}) {
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
     const body = request.method === 'GET' ? null : JSON.parse((await readBody(request)) || 'null');
-    state.requests.push({ method: request.method, path: url.pathname, search: url.search, body });
+    state.requests.push({ method: request.method, path: url.pathname, search: url.search, body,
+      headers: request.headers });
     if (!authorized(request)) {
       json(response, 401, { error: { code: 'unauthorized', message: 'invalid token' } });
       return;
